@@ -25,6 +25,7 @@ from core.compiler import compile_spec
 from core.duals import harvest_duals
 from core.exceptions import InfeasibleError, SolverError, TruffleError, UnboundedError
 from core.ir import PortfolioSpec
+from core.report import SolutionReport
 from data.estimation import estimate_moments
 
 app = typer.Typer(add_completion=False, help="Truffle: typed portfolio optimization.")
@@ -140,6 +141,105 @@ def solve(
         return
 
     console.print(_render_duals(spec, duals))
+
+
+def _render_solved(report: SolutionReport, explanation: str) -> None:
+    """Pretty-print a chat-mode solve: explanation, weights, binders."""
+    console.print(f"\n[bold]Explanation[/bold]\n{explanation}\n")
+    weights_table = Table(title="Optimal weights")
+    weights_table.add_column("Ticker", style="bold cyan")
+    weights_table.add_column("Weight", justify="right")
+    weights_table.add_column("Weight %", justify="right")
+    for ticker, w in report.weights.items():
+        weights_table.add_row(ticker, f"{w:.6f}", f"{100.0 * w:.2f}%")
+    console.print(weights_table)
+    if report.binding:
+        binders = Table(title="Binding constraints")
+        binders.add_column("Constraint", style="bold magenta")
+        binders.add_column("Shadow price", justify="right")
+        for b in report.binding:
+            binders.add_row(b.human_name, f"{b.shadow_price:.6f}")
+        console.print(binders)
+    var_line = f"  ·  VaR: {report.var:.6f}" if report.var is not None else ""
+    console.print(
+        f"[dim]objective = {report.objective_value:.6f}{var_line}  ·  "
+        f"solver = {report.solver}  ·  time = {report.solve_time_ms:.1f} ms[/dim]"
+    )
+
+
+def _load_sectors(path: Path | None) -> dict[str, str] | None:
+    if path is None:
+        return None
+    df = pd.read_csv(path)
+    if not {"ticker", "sector"}.issubset(df.columns):
+        raise SystemExit("--sectors CSV must have columns: ticker, sector.")
+    return dict(zip(df["ticker"], df["sector"], strict=True))
+
+
+@app.command()
+def chat(
+    prices: Path = typer.Option(..., "--prices", exists=True, readable=True),
+    sectors: Path | None = typer.Option(None, "--sectors", exists=True, readable=True),
+) -> None:
+    """Interactive natural-language session against ``--prices``."""
+    # Local imports keep `solve` working without anthropic/loop dependencies
+    # loaded for users who never enter chat mode.
+    from agent.client import AnthropicClient  # noqa: PLC0415
+    from agent.loop import ChatSession  # noqa: PLC0415
+
+    try:
+        client = AnthropicClient()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from None
+
+    price_df = pd.read_csv(prices, parse_dates=[0], index_col=0)
+    sector_map = _load_sectors(sectors)
+    session = ChatSession(client=client, prices=price_df, sectors=sector_map)
+
+    console.print(
+        "[bold]Truffle chat.[/bold] Tell me about the portfolio you want. "
+        "Type 'start over' to reset, Ctrl-C to exit.\n"
+    )
+    while True:
+        try:
+            user_text = console.input("[bold green]> [/bold green]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\nGoodbye.")
+            return
+        if not user_text:
+            continue
+
+        result = session.handle_user_message(user_text)
+        if result.kind == "clarification":
+            console.print(f"[yellow]?[/yellow] {result.text}\n")
+            continue
+        if result.kind == "info":
+            console.print(f"[dim]{result.text}[/dim]\n")
+            continue
+        if result.kind == "error":
+            console.print(f"[red]{result.text}[/red]\n")
+            continue
+        if result.kind == "echo":
+            console.print(result.text)
+            try:
+                decision = console.input(
+                    "\n[bold]Proceed?[/bold] [y/n/edit]: "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\nGoodbye.")
+                return
+            outcome = session.confirm_pending(decision)
+            if outcome.kind == "solved" and outcome.report and outcome.explanation:
+                _render_solved(outcome.report, outcome.explanation)
+            elif outcome.kind == "error":
+                console.print(f"[red]{outcome.text}[/red]\n")
+            else:
+                console.print(f"[dim]{outcome.text}[/dim]\n")
+            continue
+        if result.kind == "solved" and result.report and result.explanation:
+            _render_solved(result.report, result.explanation)
+            continue
 
 
 if __name__ == "__main__":
