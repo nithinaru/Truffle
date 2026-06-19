@@ -30,16 +30,25 @@ reformulation lives in exactly one place.
 from __future__ import annotations
 
 from collections.abc import Callable
+<<<<<<< HEAD
+=======
+from dataclasses import dataclass, field
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 
 import cvxpy as cp
 import numpy as np
 
 from core.compile_context import (
     BuildContext,
+<<<<<<< HEAD
     CompiledProblem,
     build_cvar_block,
     resolve_w_prev,
     validate_inputs,
+=======
+    build_cvar_block,
+    resolve_w_prev,
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     validate_scenarios,
 )
 from core.constraints import (
@@ -58,6 +67,7 @@ from core.ir import (
     FactorExposure,
     GroupCap,
     LongOnly,
+<<<<<<< HEAD
     MaxSharpe,
     MeanVariance,
     MinCVaR,
@@ -65,11 +75,19 @@ from core.ir import (
     MinVariance,
     PortfolioSpec,
     RiskParity,
+=======
+    MeanVariance,
+    MinCVaR,
+    MinVariance,
+    PortfolioSpec,
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     TrackingErrorCap,
     TransactionCost,
     TurnoverCap,
 )
+<<<<<<< HEAD
 from core.objectives import max_sharpe, min_tracking_error, risk_parity
+=======
 
 # build_cvar_block and resolve_w_prev are re-exported (imported above) so callers
 # and tests can keep importing them from core.compiler. They now live in the leaf
@@ -87,6 +105,70 @@ _CONSTRAINT_BUILDERS: dict[type, Callable[..., cp.Constraint | None]] = {
     TrackingErrorCap: tracking_error_cap.build,
     FactorExposure: factor_exposure.build,
 }
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
+
+# build_cvar_block and resolve_w_prev are re-exported (imported above) so callers
+# and tests can keep importing them from core.compiler. They now live in the leaf
+# core.compile_context module to avoid an import cycle with the constraint nodes.
+__all__ = ["CompiledProblem", "build_cvar_block", "compile_spec", "resolve_w_prev"]
+
+<<<<<<< HEAD
+# Dispatch table for Sprint 3 convex constraints. Budget/LongOnly/Box keep their
+# inline builders in _build_constraint (Sprint 1). Each entry maps the IR node
+# type to a module-level build(node, ctx) function.
+_CONSTRAINT_BUILDERS: dict[type, Callable[..., cp.Constraint | None]] = {
+    GroupCap: group_cap.build,
+    TurnoverCap: turnover_cap.build,
+    TransactionCost: transaction_cost.build,
+    CVaRLimit: cvar_limit.build,
+    TrackingErrorCap: tracking_error_cap.build,
+    FactorExposure: factor_exposure.build,
+}
+=======
+@dataclass(slots=True)
+class CompiledProblem:
+    """Container for everything the solver layer needs after compilation.
+
+    Attributes:
+        problem: The CVXPY ``Problem``. Solve it externally so the compiler
+            stays a pure builder (easier to test, easier to reason about).
+        weights: The ``cp.Variable`` representing the asset weight vector.
+        constraint_objs: ``{ir_constraint_id -> cvxpy.Constraint}``. Used by
+            :mod:`core.duals` to recover shadow prices and name them back to
+            the user. Only *hard* constraints appear here — penalty-only nodes
+            (e.g. ``TransactionCost``) contribute to the objective and are
+            intentionally absent (they have no dual).
+        spec: The originating ``PortfolioSpec`` (kept for downstream reporting).
+        extra_vars: Objective-specific auxiliary variables. For ``min_cvar``
+            this exposes ``{"t": <scalar Variable>, "z": <S-vector Variable>}``
+            so the caller can read VaR (``= t.value``) after the solve.
+    """
+
+    problem: cp.Problem
+    weights: cp.Variable
+    constraint_objs: dict[str, cp.Constraint] = field(default_factory=dict)
+    spec: PortfolioSpec | None = None
+    extra_vars: dict[str, cp.Variable] = field(default_factory=dict)
+
+
+def _validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> None:
+    n = len(spec.universe)
+    if sigma.shape != (n, n):
+        raise CompilationError(
+            f"Covariance shape {sigma.shape} does not match universe size {n}."
+        )
+    if mu.shape != (n,):
+        raise CompilationError(
+            f"Expected-return vector shape {mu.shape} does not match universe size ({n},)."
+        )
+    # Symmetrize sigma defensively — CVXPY's `quad_form` insists on PSD, and
+    # off-by-eps asymmetry from floating point is a common compile-time surprise.
+    asym = float(np.max(np.abs(sigma - sigma.T))) if sigma.size else 0.0
+    if asym > 1e-8:
+        raise CompilationError(
+            f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e})."
+        )
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 
 
 def _build_quad_objective_expr(
@@ -249,8 +331,11 @@ def compile_spec(
         hard_constraints = hard_constraints + aux
         extra_vars["t"] = t_var
         extra_vars["z"] = z_var
+<<<<<<< HEAD
     elif isinstance(obj, MinTrackingError):
         base_expr = min_tracking_error.build(obj, ctx)
+=======
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     else:
         base_expr = _build_quad_objective_expr(spec, w, mu, sigma)
 

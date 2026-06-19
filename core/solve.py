@@ -66,6 +66,25 @@ def human_name_for(c: Constraint) -> str:
     return c.id  # fallback
 
 
+<<<<<<< HEAD
+=======
+def _align_named_vectors(
+    named: dict[str, dict[str, float]] | None, universe: list[str]
+) -> dict[str, np.ndarray] | None:
+    """Align ``{name -> {ticker -> value}}`` maps to universe-ordered arrays.
+
+    Tickers absent from a given map default to 0.0. Returns ``None`` when no
+    maps were supplied so the compiler keeps its "input not provided" errors.
+    """
+    if not named:
+        return None
+    out: dict[str, np.ndarray] = {}
+    for name, by_ticker in named.items():
+        out[name] = np.array([float(by_ticker.get(t, 0.0)) for t in universe], dtype=float)
+    return out
+
+
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 def solve_spec(
     spec: PortfolioSpec,
     prices: pd.DataFrame,
@@ -115,8 +134,13 @@ def solve_spec(
         scenarios=scenarios,
         w_prev=w_prev,
         sectors=sectors,
+<<<<<<< HEAD
         benchmark_weights=align_named(benchmarks, spec.universe, label="Benchmark"),
         factor_loadings=align_named(factors, spec.universe, label="Factor"),
+=======
+        benchmark_weights=_align_named_vectors(benchmarks, spec.universe),
+        factor_loadings=_align_named_vectors(factors, spec.universe),
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     )
     start = time.perf_counter()
     try:

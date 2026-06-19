@@ -26,7 +26,10 @@ from core.ir import (
     MinVariance,
     Objective,
     PortfolioSpec,
+<<<<<<< HEAD
     RiskParity,
+=======
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     TrackingErrorCap,
     TransactionCost,
     TurnoverCap,

@@ -18,11 +18,16 @@ from core.ir import (
     FactorExposure,
     GroupCap,
     LongOnly,
+<<<<<<< HEAD
     MaxSharpe,
     MinTrackingError,
     MinVariance,
     PortfolioSpec,
     RiskParity,
+=======
+    MinVariance,
+    PortfolioSpec,
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     TrackingErrorCap,
     TransactionCost,
     TurnoverCap,
@@ -52,6 +57,7 @@ def test_render_includes_every_new_constraint() -> None:
         assert token in text, token
 
 
+<<<<<<< HEAD
 def test_render_includes_every_new_objective() -> None:
     for obj, token in [
         (MaxSharpe(), "Sharpe"),
@@ -64,6 +70,8 @@ def test_render_includes_every_new_objective() -> None:
         assert token in render_spec(spec)
 
 
+=======
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 def test_all_sprint3_example_specs_load() -> None:
     for name in [
         "spec_group_cap.yaml",
@@ -71,9 +79,12 @@ def test_all_sprint3_example_specs_load() -> None:
         "spec_cvar_limit.yaml",
         "spec_tracking_error.yaml",
         "spec_factor_exposure.yaml",
+<<<<<<< HEAD
         "spec_max_sharpe.yaml",
         "spec_risk_parity.yaml",
         "spec_min_tracking_error.yaml",
+=======
+>>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     ]:
         payload = yaml.safe_load((_EXAMPLES / name).read_text())
         spec = PortfolioSpec.model_validate(payload)
