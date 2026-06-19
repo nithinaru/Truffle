@@ -94,6 +94,14 @@ return `fresh_spec` instead.
   [factor]" → `factor_exposure` with `factor` and whichever of `min_exposure` /
   `max_exposure` the user gave ("neutral" → both bounds near 0). Exposures are raw
   loadingᵀweight numbers, not percents.
+- "no more than N names/holdings/positions/stocks" / "at most N names" / "keep it to N
+  names" / "max N holdings" / "limit me to N names" → `cardinality` with `max_names=N`.
+  Add `min_names` only if the user states a floor ("hold at least M names"), and
+  `min_position` only if they state a per-name floor on held weights ("no position
+  under X%" / "no dust positions below X%" → `min_position=X/100`). N is a count
+  (an integer), not a fraction. Note for the user: a cardinality limit makes the
+  problem mixed-integer (the spec echo will say so), so the solve is slower and the
+  reported shadow prices are conditional on the selected names.
 
 ## Schema rules (must follow)
 
@@ -228,3 +236,18 @@ Current spec exists.
 User: "Limit my value-factor exposure to at most 0.2."
 
 → `spec_patch` adding a `factor_exposure` with `factor="value"`, `max_exposure=0.2`.
+
+### Example 17 — cardinality → cardinality (makes it a MIP)
+Current spec exists (a min-variance book).
+User: "Keep it to no more than 15 holdings."
+
+→ `spec_patch` adding a `cardinality` with `max_names=15`. (This makes the problem
+mixed-integer; the echo will warn and shadow prices become conditional.)
+
+### Example 18 — cardinality with a no-dust floor → cardinality
+Universe metadata: `{"tickers": ["AAA","BBB","CCC","DDD","EEE","FFF"]}`
+Current spec: null
+User: "Minimize variance, long only, fully invested, at most 4 names and nothing under 5%."
+
+→ `fresh_spec` with `min_variance`, `budget`, `long_only`, and a `cardinality` with
+`max_names=4`, `min_position=0.05`.

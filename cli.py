@@ -144,6 +144,13 @@ def solve(
         console.print(_render_binding(report))
     else:
         console.print("[dim]No constraints are binding at the optimum.[/dim]")
+    if report.duals_conditional and report.selected_names is not None:
+        gap = "n/a" if report.optimality_gap is None else f"{report.optimality_gap:.4f}"
+        console.print(
+            f"[yellow]Mixed-integer solve:[/yellow] {len(report.selected_names)} names "
+            f"selected ({', '.join(report.selected_names)}); shadow prices above are "
+            f"conditional on this selection. Optimality gap: {gap}."
+        )
 
 
 def _render_solved(report: SolutionReport, explanation: str) -> None:
@@ -157,12 +164,24 @@ def _render_solved(report: SolutionReport, explanation: str) -> None:
         weights_table.add_row(ticker, f"{w:.6f}", f"{100.0 * w:.2f}%")
     console.print(weights_table)
     if report.binding:
-        binders = Table(title="Binding constraints")
+        title = (
+            "Binding constraints (conditional on selected names)"
+            if report.duals_conditional
+            else "Binding constraints"
+        )
+        binders = Table(title=title)
         binders.add_column("Constraint", style="bold magenta")
         binders.add_column("Shadow price", justify="right")
         for b in report.binding:
             binders.add_row(b.human_name, f"{b.shadow_price:.6f}")
         console.print(binders)
+    if report.duals_conditional and report.selected_names is not None:
+        gap = "n/a" if report.optimality_gap is None else f"{report.optimality_gap:.4f}"
+        console.print(
+            f"[yellow]Mixed-integer solve:[/yellow] {len(report.selected_names)} names "
+            f"selected ({', '.join(report.selected_names)}); shadow prices are "
+            f"conditional on this selection. Optimality gap: {gap}."
+        )
     var_line = f"  ·  VaR: {report.var:.6f}" if report.var is not None else ""
     console.print(
         f"[dim]objective = {report.objective_value:.6f}{var_line}  ·  "

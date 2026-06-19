@@ -15,6 +15,29 @@ suitable for ranking by impact:
 * Inequalities (LongOnly, Box): KKT requires duals ≥ 0; we report the
   maximum component, which is the largest binding bps cost across the
   vector entries (e.g. across assets for a universe-wide Box).
+
+Sign convention (carried over from Sprint 1, unchanged): for Truffle's
+inequality encoding ``g(w) ≥ 0`` (long-only, the stacked-slack Box/GroupCap),
+a **positive** shadow price means the constraint is binding and the objective
+would *improve* (decrease, since everything is a minimization) by that many
+units per unit of relaxation of the binding side. ~0 means slack/non-binding.
+
+Mixed-integer problems and conditional duals
+--------------------------------------------
+An integer program has **no meaningful dual variables**: the feasible set is
+not convex, so there is no Lagrangian whose multipliers price the constraints,
+and cvxpy returns ``dual_value is None`` on a MIP. Truffle therefore does *not*
+harvest duals from the MIP itself. Instead :func:`core.solve._fix_and_resolve`
+fixes the binaries at the optimal selection ``y*`` (equivalently restricts the
+universe to the selected names and drops integrality), re-solves the resulting
+**continuous** problem, and harvests duals from *that*. :func:`harvest_duals`
+runs only on such continuous problems and is unchanged.
+
+Those numbers are **conditional shadow prices**: they price each constraint
+*given the selected name set held fixed*, not globally — relaxing a cap might
+also change which names should be selected, which a conditional dual cannot see.
+The sign convention above carries over verbatim; the report flags them with
+``duals_conditional=True`` so the narration states the conditionality.
 """
 
 from __future__ import annotations
@@ -70,14 +93,15 @@ def harvest_duals(compiled: CompiledProblem) -> dict[str, float]:
     for cid, c in compiled.constraint_objs.items():
         dual = c.dual_value
         if dual is None:
-            # MIPs and a few solver paths don't return duals; in Sprint 1 the
-            # only objective forms are convex so this should be unreachable
-            # — but if it ever fires, the caller deserves a real exception
-            # rather than a silent zero.
+            # harvest_duals only ever runs on continuous solves (the convex path,
+            # or the fix-and-resolve restriction). A None dual here means a
+            # continuous solve genuinely failed to attach one — a real error, not
+            # the expected "MIP has no duals" case, which is handled upstream by
+            # routing MIPs through core.solve._fix_and_resolve instead of here.
             raise DualsUnavailableError(
-                f"Constraint {cid!r} has no dual value attached. "
-                "This typically means the problem was solved by a method that does not "
-                "produce duals (e.g. a MIP path)."
+                f"Constraint {cid!r} has no dual value attached after a continuous "
+                "solve. MIPs are handled by fix-and-resolve (see core.solve); this "
+                "indicates a solver path that did not produce duals."
             )
         arr = np.atleast_1d(np.asarray(dual, dtype=float))
         # Use the max-magnitude entry as a one-number summary. For a Box,

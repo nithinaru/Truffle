@@ -67,6 +67,26 @@ pip install trufflefin
 export ANTHROPIC_API_KEY=...   # for the natural-language layer
 ```
 
+### Mixed-integer problems (cardinality limits)
+
+A "max N names" (cardinality) limit turns the problem mixed-integer. Two backends
+cover those, both free:
+
+- **MILP** (cardinality + min-CVaR) routes to **HiGHS**, which ships with cvxpy —
+  nothing extra to install.
+- **MIQP** (cardinality + min-variance / mean-variance) routes to **SCIP**
+  (Apache-2.0) via PySCIPOpt. Install it with:
+
+  ```bash
+  pip install trufflefin[mip]   # or: pip install pyscipopt
+  ```
+
+  The `pyscipopt` wheel bundles the SCIP binaries on common platforms, so a
+  separate system SCIP install is usually unnecessary. If the wheel can't build,
+  install SCIP from <https://www.scipopt.org/> first, then `pip install pyscipopt`.
+  If SCIP is missing when you solve a MIQP, Truffle raises a clear error telling
+  you which solver to install — it never silently falls back to a wrong backend.
+
 ## Quickstart
 
 ```bash
@@ -119,7 +139,9 @@ Truffle ships with a benchmark of hand-verified natural-language → spec pairs 
 
 ## Roadmap
 
-- [ ] **Cardinality / max-names limits** (big-M MIP) — the one modeling feature not yet shipped; everything else in *Features* above is implemented and tested.
+- [x] **Cardinality / max-names limits** (big-M MIP) — shipped. A "max N names"
+  limit routes to a mixed-integer solver (HiGHS for MILP, SCIP for MIQP) and
+  returns **conditional** shadow prices (see below).
 - [ ] Multi-period optimization (stochastic programming over scenario trees)
 - [ ] Factor-model risk (Fama–French exposure constraints) — generic factor-exposure constraints ship today; named Fama–French factors are future work.
 - [ ] Black–Litterman view blending ("I think NVDA outperforms by 5%")
@@ -127,6 +149,17 @@ Truffle ships with a benchmark of hand-verified natural-language → spec pairs 
 
 ### Current limitations
 
+- **Cardinality shadow prices are conditional.** A mixed-integer optimum has no
+  native dual variables, so Truffle prices the constraints by fixing the chosen
+  names (re-solving the continuous restriction) and harvesting *that* problem's
+  duals. The reported shadow prices are therefore valid *given the selected name
+  set*, not global sensitivities — the explanation states this explicitly.
+  Cardinality currently composes with min-variance / mean-variance (MIQP) and
+  min-CVaR (MILP), under a long-only book.
+- **No infeasibility diagnosis yet.** Cardinality combined with position/sector
+  caps can produce genuinely conflicting requests; today an infeasible spec
+  raises a clear error, but the minimal-conflicting-set diagnosis (elastic
+  relaxation) is Sprint 5.
 - **Max-Sharpe** uses the Charnes–Cooper transform and currently supports only `budget` + `long_only` + `box` constraints (and requires `long_only`). Combining it with group caps, turnover, transaction cost, tracking error, CVaR or factor constraints raises a clear error; use a min-variance / mean-variance / min-CVaR objective if you need those together. Transforming arbitrary constraints through the change of variables is future work.
 - **Risk parity** is solved standalone (the convex log-barrier surrogate, normalized); it does not yet compose with additional hard constraints.
 

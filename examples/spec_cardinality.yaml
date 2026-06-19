@@ -1,0 +1,22 @@
+# Cardinality example: hold at most 3 of the 5 names (a mixed-integer problem).
+#
+# This makes the problem mixed-integer (MIQP, since the objective is variance),
+# so it routes to SCIP and reports CONDITIONAL shadow prices — valid given the
+# selected names, computed by fixing the selection and re-solving the
+# continuous restriction. Run with:
+#   truffle solve examples/spec_cardinality.yaml --prices examples/prices_sample.csv
+# SCIP is needed for this MIQP: pip install pyscipopt  (see README MIP note).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: min_variance
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: cardinality
+    id: at_most_3
+    max_names: 3

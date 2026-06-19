@@ -23,6 +23,7 @@ from typing import Annotated, ClassVar, Literal
 
 from pydantic import Field, model_validator
 
+from core.constraints.cardinality import Cardinality
 from core.constraints.cvar_limit import CVaRLimit
 from core.constraints.factor_exposure import FactorExposure
 from core.constraints.group_cap import GroupCap
@@ -42,6 +43,7 @@ __all__ = [
     "Box",
     "Budget",
     "CVaRLimit",
+    "Cardinality",
     "Constraint",
     "FactorExposure",
     "GroupCap",
@@ -177,7 +179,8 @@ Constraint = Annotated[
     | TransactionCost
     | CVaRLimit
     | TrackingErrorCap
-    | FactorExposure,
+    | FactorExposure
+    | Cardinality,
     Field(discriminator="kind"),
 ]
 
@@ -233,6 +236,39 @@ class PortfolioSpec(_IRModel):
                     raise ValueError(
                         f"Box constraint {c.id} references tickers not in universe: {missing}."
                     )
+
+        # Cardinality semantic checks need the universe (and the position caps),
+        # which a single Cardinality node cannot see on its own.
+        cardinalities = [c for c in self.constraints if isinstance(c, Cardinality)]
+        if len(cardinalities) > 1:
+            raise ValueError(
+                f"Spec has {len(cardinalities)} Cardinality constraints; at most one is allowed."
+            )
+        if cardinalities:
+            card = cardinalities[0]
+            n = len(self.universe)
+            if card.max_names > n:
+                raise ValueError(
+                    f"Cardinality max_names={card.max_names} exceeds the universe size "
+                    f"({n}); you cannot require more names than exist."
+                )
+            # min_names ≤ max_names is enforced on the node; nothing universe-
+            # dependent to add there.
+            if card.min_position is not None:
+                # A held name must satisfy both its floor (min_position) and its
+                # cap. The tightest universe-wide cap is the smallest upper bound
+                # of any Box that applies to every asset (tickers is None).
+                universe_caps = [
+                    c.upper for c in self.constraints if isinstance(c, Box) and c.tickers is None
+                ]
+                if universe_caps:
+                    tightest = min(universe_caps)
+                    if card.min_position > tightest:
+                        raise ValueError(
+                            f"Cardinality min_position={card.min_position} exceeds the "
+                            f"universe-wide position cap ({tightest}); a selected name "
+                            "cannot satisfy both the floor and the cap."
+                        )
 
         # current_weights keys must be a subset of the universe — a weight on
         # an unknown ticker is almost certainly a user/agent mistake we should

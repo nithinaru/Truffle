@@ -204,6 +204,9 @@ class BuildContext:
     group_map: dict[str, str] | None = None
     benchmark_weights: dict[str, np.ndarray] | None = None
     factor_loadings: dict[str, np.ndarray] | None = None
+    # Per-asset weight upper bounds (from Box nodes), used as the cardinality
+    # big-M. ``None`` means "no tighter cap than 1.0 per name".
+    weight_upper: np.ndarray | None = None
 
     penalties: list[cp.Expression] = field(default_factory=list)
     aux_constraints: list[cp.Constraint] = field(default_factory=list)

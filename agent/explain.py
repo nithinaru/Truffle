@@ -38,6 +38,9 @@ def _report_as_json(report: SolutionReport) -> str:
         "n_assets": report.n_assets,
         "nonzero_names": report.nonzero_names,
         "binding": [asdict(b) for b in report.binding],
+        "duals_conditional": report.duals_conditional,
+        "selected_names": report.selected_names,
+        "optimality_gap": report.optimality_gap,
     }
     return json.dumps(data, indent=2)
 
@@ -58,11 +61,20 @@ def template_summary(report: SolutionReport) -> str:
     if report.var is not None:
         lines.append(f"VaR at the optimum: {report.var:.6f}.")
     lines.append(f"Nonzero positions: {report.nonzero_names} of {report.n_assets}.")
+    if report.duals_conditional:
+        # A MIP solve: name the selected count and flag the conditionality up
+        # front so the deterministic fallback also honours the Slice-3 rule.
+        lines.append(
+            f"This is a mixed-integer (cardinality) solve: {report.nonzero_names} names "
+            "were selected, and the shadow prices below are conditional — they hold "
+            "with the selected names held fixed, not globally."
+        )
     if report.binding:
         binders = ", ".join(
             f"{b.human_name} (shadow price {b.shadow_price:.6f})" for b in report.binding
         )
-        lines.append(f"Binding constraints: {binders}.")
+        prefix = "Conditional binding constraints" if report.duals_conditional else "Binding constraints"
+        lines.append(f"{prefix}: {binders}.")
     else:
         lines.append("No constraints are binding at the optimum (all shadow prices ~ 0).")
     return " ".join(lines)

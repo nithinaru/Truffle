@@ -65,6 +65,15 @@ class SolutionReport:
         nonzero_names: Tickers with weight magnitude above a small floor —
             so the narration may say "13 names selected" without that
             number being a hallucination.
+        duals_conditional: ``True`` when the shadow prices come from the MIP
+            fix-and-resolve restriction (conditional on the selected name set)
+            rather than an ordinary convex solve. The narration MUST state the
+            conditionality when this is set (see ``explain_system.md``).
+        selected_names: For a mixed-integer (cardinality) solve, the names the
+            integer program selected. ``None`` on the continuous path.
+        optimality_gap: For a mixed-integer solve, the solver's proven
+            optimality gap (~0 at ``optimal``; nonzero only if a time limit cut
+            the search short). ``None`` on the continuous path.
     """
 
     weights: dict[str, float]
@@ -77,6 +86,9 @@ class SolutionReport:
     nonzero_names: int
     var: float | None = None
     binding: list[BindingConstraint] = field(default_factory=list)
+    duals_conditional: bool = False
+    selected_names: list[str] | None = None
+    optimality_gap: float | None = None
 
 
 def build_report(
@@ -91,6 +103,9 @@ def build_report(
     constraint_human_names: dict[str, str],
     var: float | None = None,
     nonzero_floor: float = 1e-4,
+    duals_conditional: bool = False,
+    selected_names: list[str] | None = None,
+    optimality_gap: float | None = None,
 ) -> SolutionReport:
     """Assemble a ``SolutionReport`` from solver outputs and the IR id map.
 
@@ -133,4 +148,7 @@ def build_report(
         binding=binding,
         n_assets=len(weights),
         nonzero_names=nonzero_names,
+        duals_conditional=duals_conditional,
+        selected_names=selected_names,
+        optimality_gap=optimality_gap,
     )
