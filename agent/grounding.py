@@ -84,6 +84,8 @@ def _candidate_values(report: SolutionReport) -> list[float]:
     vals: list[float] = [report.objective_value, report.solve_time_ms]
     if report.var is not None:
         vals.append(report.var)
+    if report.optimality_gap is not None:
+        vals.append(report.optimality_gap)
     vals.extend(report.weights.values())
     for b in report.binding:
         vals.append(b.shadow_price)
@@ -151,6 +153,11 @@ def verify(explanation: str, report: SolutionReport) -> GroundingResult:
 
     report_values = _candidate_values(report)
     allowed_counts: set[int] = {report.n_assets, report.nonzero_names, len(report.binding)}
+    # The selected-name count ("13 selected names") is a real, in-report count
+    # for MIP solves; it equals nonzero_names but we add it explicitly so the
+    # conditional narration's count phrasing always grounds.
+    if report.selected_names is not None:
+        allowed_counts.add(len(report.selected_names))
     allowed_ints: set[int] = SMALL_INT_ALLOWLIST | allowed_counts
 
     unmatched: list[str] = []
