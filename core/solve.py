@@ -20,6 +20,7 @@ from core.exceptions import InfeasibleError, SolverError, UnboundedError
 from core.ir import (
     Box,
     Budget,
+    Cardinality,
     Constraint,
     CVaRLimit,
     FactorExposure,
@@ -62,6 +63,8 @@ def human_name_for(c: Constraint) -> str:
         return f"the tracking-error cap vs {c.benchmark}"
     if isinstance(c, FactorExposure):
         return f"the {c.factor} factor-exposure limit"
+    if isinstance(c, Cardinality):
+        return f"the cardinality limit (≤ {c.max_names} names)"
     return c.id  # fallback
 
 

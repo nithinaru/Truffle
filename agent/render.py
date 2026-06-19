@@ -14,6 +14,7 @@ from __future__ import annotations
 from core.ir import (
     Box,
     Budget,
+    Cardinality,
     Constraint,
     CVaRLimit,
     FactorExposure,
@@ -75,6 +76,13 @@ def _constraint_phrase(c: Constraint) -> str:
         lo = "−∞" if c.min_exposure is None else f"{c.min_exposure:g}"
         hi = "+∞" if c.max_exposure is None else f"{c.max_exposure:g}"
         return f"[{c.id}] {lo} ≤ {c.factor}ᵀw ≤ {hi}  (factor exposure)"
+    if isinstance(c, Cardinality):
+        floor = "" if c.min_names is None else f"{c.min_names} ≤ "
+        dust = "" if c.min_position is None else f", w_held ≥ {c.min_position:g}"
+        return (
+            f"[{c.id}] {floor}#holdings ≤ {c.max_names}{dust}  "
+            "(cardinality — makes this a mixed-integer problem)"
+        )
     raise AssertionError(f"Unknown constraint kind: {type(c).__name__}")
 
 

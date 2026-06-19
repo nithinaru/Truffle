@@ -43,6 +43,7 @@ from core.compile_context import (
     validate_scenarios,
 )
 from core.constraints import (
+    cardinality,
     cvar_limit,
     factor_exposure,
     group_cap,
@@ -54,6 +55,7 @@ from core.exceptions import CompilationError
 from core.ir import (
     Box,
     Budget,
+    Cardinality,
     CVaRLimit,
     FactorExposure,
     GroupCap,
@@ -86,7 +88,29 @@ _CONSTRAINT_BUILDERS: dict[type, Callable[..., cp.Constraint | None]] = {
     CVaRLimit: cvar_limit.build,
     TrackingErrorCap: tracking_error_cap.build,
     FactorExposure: factor_exposure.build,
+    Cardinality: cardinality.build,
 }
+
+
+def _weight_upper_bounds(spec: PortfolioSpec, ticker_index: dict[str, int]) -> np.ndarray:
+    """Per-asset weight upper bounds from Box nodes, default 1.0.
+
+    Used as the cardinality big-M: the tightest known cap on each ``w_i`` is a
+    valid (and tight) M for the ``w_i ≤ M_i · y_i`` linking constraint.
+    """
+    n = len(spec.universe)
+    ub = np.ones(n, dtype=float)
+    for c in spec.constraints:
+        if not isinstance(c, Box):
+            continue
+        idx = (
+            range(n)
+            if c.tickers is None
+            else [ticker_index[t] for t in c.tickers]
+        )
+        for i in idx:
+            ub[i] = min(ub[i], c.upper)
+    return ub
 
 
 def _build_quad_objective_expr(
@@ -218,6 +242,7 @@ def compile_spec(
         group_map=sectors,
         benchmark_weights=benchmark_weights,
         factor_loadings=factor_loadings,
+        weight_upper=_weight_upper_bounds(spec, ticker_index),
     )
 
     constraint_objs: dict[str, cp.Constraint] = {}
