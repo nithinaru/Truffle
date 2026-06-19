@@ -154,7 +154,11 @@ def solve_spec(
     if status not in {"optimal", "optimal_inaccurate"}:
         raise SolverError(f"Solver returned non-optimal status: {status!r}.")
 
-    weights = dict(zip(spec.universe, [float(x) for x in compiled.weights.value], strict=True))
+    # recovered_weights applies any change-of-variable transform (max_sharpe,
+    # risk_parity) and is identity for the standard objectives.
+    weights = dict(
+        zip(spec.universe, [float(x) for x in compiled.recovered_weights()], strict=True)
+    )
     duals = harvest_duals(compiled)
     var = (
         float(compiled.extra_vars["t"].value)

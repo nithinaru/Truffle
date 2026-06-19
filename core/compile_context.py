@@ -22,12 +22,77 @@ node only contributes a penalty (TransactionCost).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import cvxpy as cp
 import numpy as np
 
 from core.exceptions import CompilationError
+
+if TYPE_CHECKING:
+    from core.ir import PortfolioSpec
+
+
+@dataclass(slots=True)
+class CompiledProblem:
+    """Container for everything the solver layer needs after compilation.
+
+    Attributes:
+        problem: The CVXPY ``Problem``. Solve it externally so the compiler
+            stays a pure builder (easier to test, easier to reason about).
+        weights: The ``cp.Variable`` whose value the solver populates. For most
+            objectives this *is* the portfolio weight vector. For change-of-
+            variable objectives (``max_sharpe``, ``risk_parity``) it is the
+            transformed variable, and ``weight_recovery`` maps its post-solve
+            value back to portfolio weights — call :meth:`recovered_weights`.
+        constraint_objs: ``{ir_constraint_id -> cvxpy.Constraint}``. Used by
+            :mod:`core.duals` to recover shadow prices and name them back to
+            the user. Only *hard* constraints appear here — penalty-only nodes
+            (e.g. ``TransactionCost``) contribute to the objective and are
+            intentionally absent (they have no dual).
+        spec: The originating ``PortfolioSpec`` (kept for downstream reporting).
+        extra_vars: Objective-specific auxiliary variables. For ``min_cvar``
+            this exposes ``{"t": <scalar Variable>, "z": <S-vector Variable>}``
+            so the caller can read VaR (``= t.value``) after the solve.
+        weight_recovery: Optional post-solve callable returning the final
+            portfolio weights as an array. ``None`` means weights are read
+            directly from ``weights.value``.
+    """
+
+    problem: cp.Problem
+    weights: cp.Variable
+    constraint_objs: dict[str, cp.Constraint] = field(default_factory=dict)
+    spec: PortfolioSpec | None = None
+    extra_vars: dict[str, cp.Variable] = field(default_factory=dict)
+    weight_recovery: Callable[[], np.ndarray] | None = None
+
+    def recovered_weights(self) -> np.ndarray:
+        """Return final portfolio weights, applying ``weight_recovery`` if set."""
+        if self.weight_recovery is not None:
+            return np.asarray(self.weight_recovery(), dtype=float)
+        return np.asarray(self.weights.value, dtype=float)
+
+
+def validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> None:
+    """Shape/symmetry checks shared by every compile path."""
+    n = len(spec.universe)
+    if sigma.shape != (n, n):
+        raise CompilationError(
+            f"Covariance shape {sigma.shape} does not match universe size {n}."
+        )
+    if mu.shape != (n,):
+        raise CompilationError(
+            f"Expected-return vector shape {mu.shape} does not match universe size ({n},)."
+        )
+    # Symmetrize sigma defensively — CVXPY's `quad_form` insists on PSD, and
+    # off-by-eps asymmetry from floating point is a common compile-time surprise.
+    asym = float(np.max(np.abs(sigma - sigma.T))) if sigma.size else 0.0
+    if asym > 1e-8:
+        raise CompilationError(
+            f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e})."
+        )
 
 
 def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:

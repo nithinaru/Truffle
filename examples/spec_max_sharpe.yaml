@@ -1,0 +1,19 @@
+# MaxSharpe example (Charnes–Cooper transform).
+# Long-only is required; budget + long-only + box are the supported constraints
+# this sprint. risk_free_rate defaults to 0.
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: max_sharpe
+  risk_free_rate: 0.0
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: box
+    id: position_cap
+    lower: 0.0
+    upper: 0.40

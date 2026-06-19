@@ -124,7 +124,7 @@ def solve(
         console.print(f"[red]Problem is unbounded[/red] (status: {status}).")
         raise typer.Exit(code=4)
 
-    weights = list(compiled.weights.value)
+    weights = list(compiled.recovered_weights())
     console.print(_render_weights(spec, weights))
 
     console.print(

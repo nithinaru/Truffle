@@ -30,15 +30,16 @@ reformulation lives in exactly one place.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
 
 import cvxpy as cp
 import numpy as np
 
 from core.compile_context import (
     BuildContext,
+    CompiledProblem,
     build_cvar_block,
     resolve_w_prev,
+    validate_inputs,
     validate_scenarios,
 )
 from core.constraints import (
@@ -57,14 +58,18 @@ from core.ir import (
     FactorExposure,
     GroupCap,
     LongOnly,
+    MaxSharpe,
     MeanVariance,
     MinCVaR,
+    MinTrackingError,
     MinVariance,
     PortfolioSpec,
+    RiskParity,
     TrackingErrorCap,
     TransactionCost,
     TurnoverCap,
 )
+from core.objectives import max_sharpe, min_tracking_error, risk_parity
 
 # build_cvar_block and resolve_w_prev are re-exported (imported above) so callers
 # and tests can keep importing them from core.compiler. They now live in the leaf
@@ -82,51 +87,6 @@ _CONSTRAINT_BUILDERS: dict[type, Callable[..., cp.Constraint | None]] = {
     TrackingErrorCap: tracking_error_cap.build,
     FactorExposure: factor_exposure.build,
 }
-
-
-@dataclass(slots=True)
-class CompiledProblem:
-    """Container for everything the solver layer needs after compilation.
-
-    Attributes:
-        problem: The CVXPY ``Problem``. Solve it externally so the compiler
-            stays a pure builder (easier to test, easier to reason about).
-        weights: The ``cp.Variable`` representing the asset weight vector.
-        constraint_objs: ``{ir_constraint_id -> cvxpy.Constraint}``. Used by
-            :mod:`core.duals` to recover shadow prices and name them back to
-            the user. Only *hard* constraints appear here — penalty-only nodes
-            (e.g. ``TransactionCost``) contribute to the objective and are
-            intentionally absent (they have no dual).
-        spec: The originating ``PortfolioSpec`` (kept for downstream reporting).
-        extra_vars: Objective-specific auxiliary variables. For ``min_cvar``
-            this exposes ``{"t": <scalar Variable>, "z": <S-vector Variable>}``
-            so the caller can read VaR (``= t.value``) after the solve.
-    """
-
-    problem: cp.Problem
-    weights: cp.Variable
-    constraint_objs: dict[str, cp.Constraint] = field(default_factory=dict)
-    spec: PortfolioSpec | None = None
-    extra_vars: dict[str, cp.Variable] = field(default_factory=dict)
-
-
-def _validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> None:
-    n = len(spec.universe)
-    if sigma.shape != (n, n):
-        raise CompilationError(
-            f"Covariance shape {sigma.shape} does not match universe size {n}."
-        )
-    if mu.shape != (n,):
-        raise CompilationError(
-            f"Expected-return vector shape {mu.shape} does not match universe size ({n},)."
-        )
-    # Symmetrize sigma defensively — CVXPY's `quad_form` insists on PSD, and
-    # off-by-eps asymmetry from floating point is a common compile-time surprise.
-    asym = float(np.max(np.abs(sigma - sigma.T))) if sigma.size else 0.0
-    if asym > 1e-8:
-        raise CompilationError(
-            f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e})."
-        )
 
 
 def _build_quad_objective_expr(
@@ -233,7 +193,14 @@ def compile_spec(
             are missing/malformed for CVaR, or the IR contains an
             objective/constraint kind the compiler does not understand.
     """
-    _validate_inputs(spec, mu, sigma)
+    validate_inputs(spec, mu, sigma)
+
+    # Change-of-variable objectives build their own transformed problem (they do
+    # not optimize over w directly) and return early with a weight-recovery hook.
+    if isinstance(spec.objective, MaxSharpe):
+        return max_sharpe.build(spec.objective, spec, mu, sigma)
+    if isinstance(spec.objective, RiskParity):
+        return risk_parity.build(spec.objective, spec, mu, sigma)
 
     n = len(spec.universe)
     w = cp.Variable(n, name="w")
@@ -282,6 +249,8 @@ def compile_spec(
         hard_constraints = hard_constraints + aux
         extra_vars["t"] = t_var
         extra_vars["z"] = z_var
+    elif isinstance(obj, MinTrackingError):
+        base_expr = min_tracking_error.build(obj, ctx)
     else:
         base_expr = _build_quad_objective_expr(spec, w, mu, sigma)
 

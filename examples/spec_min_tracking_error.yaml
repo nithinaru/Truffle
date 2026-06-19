@@ -1,0 +1,14 @@
+# MinTrackingError example: minimize (w − b)ᵀ Σ (w − b) vs a benchmark.
+# Requires benchmark weights as data (CLI: --benchmark examples/benchmark_sample.csv).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: min_tracking_error
+  benchmark: bench
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts

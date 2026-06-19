@@ -1,0 +1,11 @@
+# RiskParity example (convex log-barrier surrogate).
+# Solved standalone; budget / long_only are redundant here (the log domain keeps
+# weights positive and the result is normalized to sum to 1).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: risk_parity
+
+constraints:
+  - kind: long_only
+    id: no_shorts

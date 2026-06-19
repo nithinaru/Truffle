@@ -19,11 +19,14 @@ from core.ir import (
     FactorExposure,
     GroupCap,
     LongOnly,
+    MaxSharpe,
     MeanVariance,
     MinCVaR,
+    MinTrackingError,
     MinVariance,
     Objective,
     PortfolioSpec,
+    RiskParity,
     TrackingErrorCap,
     TransactionCost,
     TurnoverCap,
@@ -37,6 +40,12 @@ def _objective_phrase(obj: Objective) -> str:
         return f"Mean-variance (min wᵀΣw − λμᵀw with λ = {obj.risk_aversion:g})"
     if isinstance(obj, MinCVaR):
         return f"Minimize CVaR at α = {obj.cvar_alpha:g}"
+    if isinstance(obj, MaxSharpe):
+        return f"Maximize Sharpe ratio (Charnes–Cooper, r_f = {obj.risk_free_rate:g})"
+    if isinstance(obj, RiskParity):
+        return "Risk parity (equal risk contribution, convex log-barrier)"
+    if isinstance(obj, MinTrackingError):
+        return f"Minimize tracking error vs {obj.benchmark}"
     raise AssertionError(f"Unknown objective kind: {type(obj).__name__}")
 
 
