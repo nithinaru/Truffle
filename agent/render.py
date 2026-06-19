@@ -15,12 +15,18 @@ from core.ir import (
     Box,
     Budget,
     Constraint,
+    CVaRLimit,
+    FactorExposure,
+    GroupCap,
     LongOnly,
     MeanVariance,
     MinCVaR,
     MinVariance,
     Objective,
     PortfolioSpec,
+    TrackingErrorCap,
+    TransactionCost,
+    TurnoverCap,
 )
 
 
@@ -45,6 +51,21 @@ def _constraint_phrase(c: Constraint) -> str:
             f"[{c.id}] {c.lower:g} ≤ w ≤ {c.upper:g}  on {scope}"
             f"  (box)"
         )
+    if isinstance(c, GroupCap):
+        floor = "" if c.min_weight is None else f"{c.min_weight:g} ≤ "
+        return f"[{c.id}] {floor}Σw[{c.group}] ≤ {c.max_weight:g}  (group cap)"
+    if isinstance(c, TurnoverCap):
+        return f"[{c.id}] ‖w − w_prev‖₁ ≤ {c.max_turnover:g}  (turnover cap)"
+    if isinstance(c, TransactionCost):
+        return f"[{c.id}] {c.bps:g} bps · ‖w − w_prev‖₁  (transaction cost → objective penalty)"
+    if isinstance(c, CVaRLimit):
+        return f"[{c.id}] CVaR(α={c.alpha:g}) ≤ {c.max_cvar:g}  (CVaR limit)"
+    if isinstance(c, TrackingErrorCap):
+        return f"[{c.id}] TE vs {c.benchmark} ≤ {c.max_te:g}  (tracking-error cap)"
+    if isinstance(c, FactorExposure):
+        lo = "−∞" if c.min_exposure is None else f"{c.min_exposure:g}"
+        hi = "+∞" if c.max_exposure is None else f"{c.max_exposure:g}"
+        return f"[{c.id}] {lo} ≤ {c.factor}ᵀw ≤ {hi}  (factor exposure)"
     raise AssertionError(f"Unknown constraint kind: {type(c).__name__}")
 
 

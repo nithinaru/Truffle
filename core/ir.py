@@ -19,21 +19,40 @@ Design rules (from BLUEPRINT.md sections 4 & 5):
 
 from __future__ import annotations
 
-import uuid
 from typing import Annotated, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
-ProblemClassImpact = Literal["convex", "mip"]
+from core.constraints.cvar_limit import CVaRLimit
+from core.constraints.factor_exposure import FactorExposure
+from core.constraints.group_cap import GroupCap
+from core.constraints.tracking_error_cap import TrackingErrorCap
+from core.constraints.transaction_cost import TransactionCost
+from core.constraints.turnover_cap import TurnoverCap
 
+# Base IR model + helpers live in the dependency-light core.irbase leaf module so
+# the per-node constraint modules above can subclass _IRModel without cycling
+# back through this module.
+from core.irbase import ProblemClassImpact, _IRModel, _new_id
 
-def _new_id(prefix: str) -> str:
-    """Short stable id, prefixed by constraint kind for readability in logs."""
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
-
-
-class _IRModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=False)
+__all__ = [
+    "Box",
+    "Budget",
+    "CVaRLimit",
+    "Constraint",
+    "FactorExposure",
+    "GroupCap",
+    "LongOnly",
+    "MeanVariance",
+    "MinCVaR",
+    "MinVariance",
+    "Objective",
+    "PortfolioSpec",
+    "ProblemClassImpact",
+    "TrackingErrorCap",
+    "TransactionCost",
+    "TurnoverCap",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +162,18 @@ class Box(_IRModel):
         return self
 
 
-Constraint = Annotated[Budget | LongOnly | Box, Field(discriminator="kind")]
+Constraint = Annotated[
+    Budget
+    | LongOnly
+    | Box
+    | GroupCap
+    | TurnoverCap
+    | TransactionCost
+    | CVaRLimit
+    | TrackingErrorCap
+    | FactorExposure,
+    Field(discriminator="kind"),
+]
 
 
 # ---------------------------------------------------------------------------

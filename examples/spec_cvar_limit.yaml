@@ -1,0 +1,19 @@
+# CVaRLimit example: minimize variance subject to a tail-risk cap.
+# CVaR(alpha=0.95) of portfolio losses must stay <= 4% (return-fraction units).
+# Like the min_cvar objective, this needs a scenario matrix; the solve path
+# derives one from the price panel automatically.
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: min_variance
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: cvar_limit
+    id: tail_cap
+    alpha: 0.95
+    max_cvar: 0.04

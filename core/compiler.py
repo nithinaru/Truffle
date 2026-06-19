@@ -29,13 +29,59 @@ reformulation lives in exactly one place.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import cvxpy as cp
 import numpy as np
 
+from core.compile_context import (
+    BuildContext,
+    build_cvar_block,
+    resolve_w_prev,
+    validate_scenarios,
+)
+from core.constraints import (
+    cvar_limit,
+    factor_exposure,
+    group_cap,
+    tracking_error_cap,
+    transaction_cost,
+    turnover_cap,
+)
 from core.exceptions import CompilationError
-from core.ir import Box, Budget, LongOnly, MeanVariance, MinCVaR, MinVariance, PortfolioSpec
+from core.ir import (
+    Box,
+    Budget,
+    CVaRLimit,
+    FactorExposure,
+    GroupCap,
+    LongOnly,
+    MeanVariance,
+    MinCVaR,
+    MinVariance,
+    PortfolioSpec,
+    TrackingErrorCap,
+    TransactionCost,
+    TurnoverCap,
+)
+
+# build_cvar_block and resolve_w_prev are re-exported (imported above) so callers
+# and tests can keep importing them from core.compiler. They now live in the leaf
+# core.compile_context module to avoid an import cycle with the constraint nodes.
+__all__ = ["CompiledProblem", "build_cvar_block", "compile_spec", "resolve_w_prev"]
+
+# Dispatch table for Sprint 3 convex constraints. Budget/LongOnly/Box keep their
+# inline builders in _build_constraint (Sprint 1). Each entry maps the IR node
+# type to a module-level build(node, ctx) function.
+_CONSTRAINT_BUILDERS: dict[type, Callable[..., cp.Constraint | None]] = {
+    GroupCap: group_cap.build,
+    TurnoverCap: turnover_cap.build,
+    TransactionCost: transaction_cost.build,
+    CVaRLimit: cvar_limit.build,
+    TrackingErrorCap: tracking_error_cap.build,
+    FactorExposure: factor_exposure.build,
+}
 
 
 @dataclass(slots=True)
@@ -81,85 +127,6 @@ def _validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> 
         raise CompilationError(
             f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e})."
         )
-
-
-def _validate_scenarios(scenarios: np.ndarray | None, n: int) -> np.ndarray:
-    """Coerce and shape-check a scenario matrix for the Rockafellar–Uryasev LP.
-
-    Shared by the ``MinCVaR`` objective and the ``CVaRLimit`` constraint so the
-    error messages (and the contract) are identical at both call sites.
-    """
-    if scenarios is None:
-        raise CompilationError(
-            "min_cvar objective requires a scenario matrix; got scenarios=None. "
-            "Pass scenarios from data.scenarios.historical_scenarios(prices) (or another generator)."
-        )
-    scenarios = np.asarray(scenarios, dtype=float)
-    if scenarios.ndim != 2 or scenarios.shape[1] != n:
-        raise CompilationError(
-            f"Scenario matrix must have shape (S, {n}); got {scenarios.shape}."
-        )
-    if scenarios.shape[0] < 1:
-        raise CompilationError("Scenario matrix must have at least one scenario row.")
-    return scenarios
-
-
-def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:
-    """Resolve the pre-trade weight vector used by turnover / transaction cost.
-
-    Convention (documented on :attr:`core.ir.PortfolioSpec.current_weights`):
-    ``None`` means a zero vector of length ``n`` — the portfolio is being built
-    fresh from cash, so every position change equals the target weight. A
-    supplied vector must already be aligned to the universe and length ``n``.
-    """
-    if w_prev is None:
-        return np.zeros(n, dtype=float)
-    w_prev = np.asarray(w_prev, dtype=float)
-    if w_prev.shape != (n,):
-        raise CompilationError(
-            f"w_prev vector shape {w_prev.shape} does not match universe size ({n},)."
-        )
-    return w_prev
-
-
-def build_cvar_block(
-    scenarios: np.ndarray,
-    w: cp.Variable,
-    alpha: float,
-    *,
-    name_suffix: str = "",
-) -> tuple[cp.Expression, cp.Variable, cp.Variable, list[cp.Constraint]]:
-    """Build the Rockafellar–Uryasev CVaR block for weights ``w``.
-
-    For ``S`` equally-likely return scenarios (rows of ``scenarios``), portfolio
-    losses are ``L_s = -r_s · w`` and
-
-        CVaR_α(w) = min_t  t + (1/((1-α)S)) Σ_s max(L_s - t, 0).
-
-    Linearizing the ``max`` with non-negative slacks ``z_s`` gives the LP whose
-    auxiliary pieces this helper returns. The optimal ``t`` is the VaR.
-
-    Args:
-        scenarios: ``(S, n)`` return matrix (already validated/coerced).
-        w: weight variable of length ``n``.
-        alpha: CVaR confidence level in ``(0, 1)``.
-        name_suffix: appended to the ``t``/``z`` variable names so multiple
-            blocks (e.g. a ``MinCVaR`` objective plus one or more ``CVaRLimit``
-            constraints) coexist with distinct names.
-
-    Returns:
-        ``(cvar_expr, t_var, z_var, aux_constraints)`` — the scalar CVaR
-        expression, the VaR variable ``t``, the slack vector ``z``, and the
-        list of linking constraints (``z >= loss - t``) the caller must add to
-        the problem. ``z >= 0`` is encoded via ``nonneg=True``.
-    """
-    s = scenarios.shape[0]
-    t_var = cp.Variable(name=f"t{name_suffix}")
-    z_var = cp.Variable(s, name=f"z{name_suffix}", nonneg=True)
-    loss = -scenarios @ w
-    aux: list[cp.Constraint] = [z_var >= loss - t_var]
-    cvar_expr = t_var + cp.sum(z_var) / ((1.0 - alpha) * s)
-    return cvar_expr, t_var, z_var, aux
 
 
 def _build_quad_objective_expr(
@@ -230,6 +197,9 @@ def compile_spec(
     sigma: np.ndarray,
     scenarios: np.ndarray | None = None,
     w_prev: np.ndarray | None = None,
+    sectors: dict[str, str] | None = None,
+    benchmark_weights: dict[str, np.ndarray] | None = None,
+    factor_loadings: dict[str, np.ndarray] | None = None,
 ) -> CompiledProblem:
     """Deterministically build a CVXPY problem from an IR spec.
 
@@ -247,6 +217,11 @@ def compile_spec(
         w_prev: Pre-trade weight vector aligned to ``spec.universe``, used by
             turnover / transaction-cost terms. ``None`` resolves to the zero
             vector ("fresh from cash"); see :func:`resolve_w_prev`.
+        sectors: ``{ticker -> group}`` mapping required by ``GroupCap``.
+        benchmark_weights: ``{name -> weight vector}`` aligned to the universe,
+            required by ``TrackingErrorCap`` (and ``MinTrackingError``).
+        factor_loadings: ``{name -> loading vector}`` aligned to the universe,
+            required by ``FactorExposure``.
 
     Returns:
         ``CompiledProblem`` wrapping the unsolved CVXPY problem, the weight
@@ -264,30 +239,49 @@ def compile_spec(
     w = cp.Variable(n, name="w")
     ticker_index = {t: i for i, t in enumerate(spec.universe)}
     # Resolved once so every constraint builder sees the same pre-trade vector.
-    # Threaded into _build_constraint now; consumed by Slice 2's turnover /
-    # transaction-cost nodes.
     w_prev_vec = resolve_w_prev(w_prev, n)
+
+    ctx = BuildContext(
+        w=w,
+        n=n,
+        ticker_index=ticker_index,
+        w_prev=w_prev_vec,
+        sigma=sigma,
+        scenarios=scenarios,
+        group_map=sectors,
+        benchmark_weights=benchmark_weights,
+        factor_loadings=factor_loadings,
+    )
 
     constraint_objs: dict[str, cp.Constraint] = {}
     hard_constraints: list[cp.Constraint] = []
     for c in spec.constraints:
-        cons = _build_constraint(c, w, ticker_index, w_prev_vec)
-        constraint_objs[c.id] = cons
-        hard_constraints.append(cons)
+        if isinstance(c, Budget | LongOnly | Box):
+            cons = _build_constraint(c, w, ticker_index, w_prev_vec)
+        else:
+            builder = _CONSTRAINT_BUILDERS.get(type(c))
+            if builder is None:
+                raise CompilationError(f"No compiler builder for constraint {type(c).__name__}.")
+            cons = builder(c, ctx)
+        # Penalty-only nodes (TransactionCost) return None: no hard constraint,
+        # no dual, so they are intentionally absent from constraint_objs.
+        if cons is not None:
+            constraint_objs[c.id] = cons
+            hard_constraints.append(cons)
 
-    # Penalty terms contributed by constraints that modify the objective rather
-    # than adding a hard constraint. Empty until Slice 2's TransactionCost; the
-    # accumulation path is wired now so that feature is a pure addition.
-    penalties: list[cp.Expression] = []
-
-    extra_vars: dict[str, cp.Variable] = {}
+    # Penalty terms (TransactionCost) and unnamed auxiliary constraints (L1
+    # epigraphs, CVaR linking rows) the builders accumulated on the context.
+    penalties: list[cp.Expression] = list(ctx.penalties)
+    hard_constraints.extend(ctx.aux_constraints)
+    extra_vars: dict[str, cp.Variable] = dict(ctx.extra_vars)
 
     obj = spec.objective
     if isinstance(obj, MinCVaR):
-        scenarios = _validate_scenarios(scenarios, n)
+        scenarios = validate_scenarios(scenarios, n)
         base_expr, t_var, z_var, aux = build_cvar_block(scenarios, w, obj.cvar_alpha)
         hard_constraints = hard_constraints + aux
-        extra_vars = {"t": t_var, "z": z_var}
+        extra_vars["t"] = t_var
+        extra_vars["z"] = z_var
     else:
         base_expr = _build_quad_objective_expr(spec, w, mu, sigma)
 

@@ -1,0 +1,29 @@
+# TurnoverCap + TransactionCost example, starting from an existing book.
+# current_weights are the pre-trade holdings; absent tickers default to 0.0.
+# TurnoverCap bounds total trading; TransactionCost adds a 15bps penalty that
+# discourages trading away from current_weights (it modifies the objective and
+# adds no hard constraint, so it has no shadow price).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+current_weights:
+  AAA: 0.20
+  BBB: 0.20
+  CCC: 0.20
+  DDD: 0.20
+  EEE: 0.20
+
+objective:
+  kind: min_variance
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: turnover_cap
+    id: turnover
+    max_turnover: 0.30
+  - kind: transaction_cost
+    id: tcost
+    bps: 15.0

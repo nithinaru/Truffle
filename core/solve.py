@@ -17,7 +17,20 @@ import pandas as pd
 from core.compiler import compile_spec
 from core.duals import harvest_duals
 from core.exceptions import InfeasibleError, SolverError, UnboundedError
-from core.ir import Box, Budget, Constraint, LongOnly, MinCVaR, PortfolioSpec
+from core.ir import (
+    Box,
+    Budget,
+    Constraint,
+    CVaRLimit,
+    FactorExposure,
+    GroupCap,
+    LongOnly,
+    MinCVaR,
+    PortfolioSpec,
+    TrackingErrorCap,
+    TransactionCost,
+    TurnoverCap,
+)
 from core.report import SolutionReport, build_report
 from data.estimation import estimate_moments
 from data.scenarios import historical_scenarios
@@ -37,10 +50,45 @@ def human_name_for(c: Constraint) -> str:
         if c.tickers:
             return f"the position cap on {', '.join(c.tickers)}"
         return "the universe-wide position bounds"
+    if isinstance(c, GroupCap):
+        return f"the {c.group} group cap"
+    if isinstance(c, TurnoverCap):
+        return "the turnover cap"
+    if isinstance(c, TransactionCost):
+        return "the transaction-cost penalty"
+    if isinstance(c, CVaRLimit):
+        return f"the CVaR limit (α={c.alpha:g})"
+    if isinstance(c, TrackingErrorCap):
+        return f"the tracking-error cap vs {c.benchmark}"
+    if isinstance(c, FactorExposure):
+        return f"the {c.factor} factor-exposure limit"
     return c.id  # fallback
 
 
-def solve_spec(spec: PortfolioSpec, prices: pd.DataFrame) -> tuple[object, SolutionReport]:
+def _align_named_vectors(
+    named: dict[str, dict[str, float]] | None, universe: list[str]
+) -> dict[str, np.ndarray] | None:
+    """Align ``{name -> {ticker -> value}}`` maps to universe-ordered arrays.
+
+    Tickers absent from a given map default to 0.0. Returns ``None`` when no
+    maps were supplied so the compiler keeps its "input not provided" errors.
+    """
+    if not named:
+        return None
+    out: dict[str, np.ndarray] = {}
+    for name, by_ticker in named.items():
+        out[name] = np.array([float(by_ticker.get(t, 0.0)) for t in universe], dtype=float)
+    return out
+
+
+def solve_spec(
+    spec: PortfolioSpec,
+    prices: pd.DataFrame,
+    *,
+    sectors: dict[str, str] | None = None,
+    benchmarks: dict[str, dict[str, float]] | None = None,
+    factors: dict[str, dict[str, float]] | None = None,
+) -> tuple[object, SolutionReport]:
     """Estimate moments, compile, solve, harvest duals, build a SolutionReport.
 
     Args:
@@ -48,6 +96,10 @@ def solve_spec(spec: PortfolioSpec, prices: pd.DataFrame) -> tuple[object, Solut
             ``prices.columns``.
         prices: price panel; columns must include every ticker in
             ``spec.universe``.
+        sectors: ``{ticker -> group}`` mapping for ``GroupCap``.
+        benchmarks: ``{name -> {ticker -> weight}}`` for tracking-error nodes;
+            aligned to the universe (missing tickers -> 0.0).
+        factors: ``{name -> {ticker -> loading}}`` for ``FactorExposure``.
 
     Returns:
         ``(compiled, report)`` — the compiled problem (for callers that want
@@ -63,11 +115,24 @@ def solve_spec(spec: PortfolioSpec, prices: pd.DataFrame) -> tuple[object, Solut
         raise SolverError(f"Prices CSV is missing universe tickers: {missing}.")
     panel = prices[spec.universe]
     mu, sigma = estimate_moments(panel)
-    scenarios = historical_scenarios(panel) if isinstance(spec.objective, MinCVaR) else None
+    # Scenarios are needed by the MinCVaR objective *and* by any CVaRLimit node.
+    needs_scenarios = isinstance(spec.objective, MinCVaR) or any(
+        isinstance(c, CVaRLimit) for c in spec.constraints
+    )
+    scenarios = historical_scenarios(panel) if needs_scenarios else None
     # Single-shot pre-trade vector; absent holdings default to 0.0 ("from cash").
     w_prev = np.asarray(spec.w_prev_vector(), dtype=float)
 
-    compiled = compile_spec(spec, mu=mu, sigma=sigma, scenarios=scenarios, w_prev=w_prev)
+    compiled = compile_spec(
+        spec,
+        mu=mu,
+        sigma=sigma,
+        scenarios=scenarios,
+        w_prev=w_prev,
+        sectors=sectors,
+        benchmark_weights=_align_named_vectors(benchmarks, spec.universe),
+        factor_loadings=_align_named_vectors(factors, spec.universe),
+    )
     start = time.perf_counter()
     try:
         compiled.problem.solve(solver=cp.CLARABEL)

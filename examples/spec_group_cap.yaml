@@ -1,0 +1,17 @@
+# GroupCap example: cap the "Tech" group at 40% of the book.
+# Requires a ticker->group mapping (CLI: --sectors examples/sectors_sample.csv).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: min_variance
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: group_cap
+    id: tech_cap
+    group: Tech
+    max_weight: 0.40
