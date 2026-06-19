@@ -22,20 +22,15 @@ node only contributes a penalty (TransactionCost).
 
 from __future__ import annotations
 
-<<<<<<< HEAD
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-=======
-from dataclasses import dataclass, field
->>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 
 import cvxpy as cp
 import numpy as np
 
 from core.exceptions import CompilationError
 
-<<<<<<< HEAD
 if TYPE_CHECKING:
     from core.ir import PortfolioSpec
 
@@ -99,8 +94,6 @@ def validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> N
             f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e})."
         )
 
-=======
->>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 
 def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:
     """Resolve the pre-trade weight vector used by turnover / transaction cost.

@@ -31,18 +31,12 @@ from core.constraints.transaction_cost import TransactionCost
 from core.constraints.turnover_cap import TurnoverCap
 
 # Base IR model + helpers live in the dependency-light core.irbase leaf module so
-<<<<<<< HEAD
 # the per-node constraint/objective modules above can subclass _IRModel without
 # cycling back through this module.
 from core.irbase import ProblemClassImpact, _IRModel, _new_id
 from core.objectives.max_sharpe import MaxSharpe
 from core.objectives.min_tracking_error import MinTrackingError
 from core.objectives.risk_parity import RiskParity
-=======
-# the per-node constraint modules above can subclass _IRModel without cycling
-# back through this module.
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
->>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
 
 __all__ = [
     "Box",
@@ -52,23 +46,15 @@ __all__ = [
     "FactorExposure",
     "GroupCap",
     "LongOnly",
-<<<<<<< HEAD
     "MaxSharpe",
     "MeanVariance",
     "MinCVaR",
     "MinTrackingError",
-=======
-    "MeanVariance",
-    "MinCVaR",
->>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     "MinVariance",
     "Objective",
     "PortfolioSpec",
     "ProblemClassImpact",
-<<<<<<< HEAD
     "RiskParity",
-=======
->>>>>>> a5022583a07f36e1c5a037b2010729b3ab448d2d
     "TrackingErrorCap",
     "TransactionCost",
     "TurnoverCap",
