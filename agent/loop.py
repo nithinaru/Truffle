@@ -52,6 +52,33 @@ from core.solve import solve_spec
 
 RESET_PHRASES = frozenset({"start over", "new portfolio", "reset", "/reset"})
 
+# Universe-size guard for mixed-integer solves: branch-and-bound can grow
+# expensive when the universe is large relative to the cardinality cap. At or
+# above this universe size we both warn the user and pass the solver a
+# wall-clock limit (so the demo stays responsive and any early stop is reported
+# via the optimality gap).
+MIP_UNIVERSE_GUARD = 30
+MIP_TIME_LIMIT_S = 30.0
+
+
+def _mip_guard(spec: PortfolioSpec) -> tuple[float | None, str | None]:
+    """Return ``(time_limit_s, warning)`` for a mixed-integer spec.
+
+    ``(None, None)`` for continuous specs and for small mixed-integer ones; the
+    continuous UX is therefore completely untouched.
+    """
+    if spec.problem_class != "mip":
+        return None, None
+    n = len(spec.universe)
+    if n >= MIP_UNIVERSE_GUARD:
+        warn = (
+            f"Note: {n} names is large for a mixed-integer search, so the solver "
+            f"is capped at {MIP_TIME_LIMIT_S:g}s; I'll report the optimality gap "
+            "it reaches (0 means proven optimal)."
+        )
+        return MIP_TIME_LIMIT_S, warn
+    return None, None
+
 
 @dataclass
 class _Pending:
@@ -61,6 +88,7 @@ class _Pending:
     echo: str
     from_patch: SpecPatch | None = None
     prior_spec: PortfolioSpec | None = None
+    time_limit_s: float | None = None
 
 
 @dataclass
@@ -133,7 +161,10 @@ class ChatSession:
         if isinstance(parse, FreshSpec):
             spec = parse.spec
             echo = render_spec(spec)
-            self.pending = _Pending(spec=spec, echo=echo)
+            time_limit, guard_warn = _mip_guard(spec)
+            if guard_warn:
+                echo = f"{echo}\n\n{guard_warn}"
+            self.pending = _Pending(spec=spec, echo=echo, time_limit_s=time_limit)
             return TurnResult(kind="echo", text=echo, pending_spec=spec)
         if isinstance(parse, SpecPatch):
             if self.current_spec is None:
@@ -148,11 +179,15 @@ class ChatSession:
             except ValueError as e:
                 return TurnResult(kind="error", text=f"The patch would produce an invalid spec.\n{e}")
             diff = render_patch(parse, self.current_spec, new_spec)
+            time_limit, guard_warn = _mip_guard(new_spec)
+            if guard_warn:
+                diff = f"{diff}\n\n{guard_warn}"
             self.pending = _Pending(
                 spec=new_spec,
                 echo=diff,
                 from_patch=parse,
                 prior_spec=self.current_spec,
+                time_limit_s=time_limit,
             )
             return TurnResult(kind="echo", text=diff, pending_spec=new_spec)
         raise AssertionError(f"Unknown ParseResult: {type(parse).__name__}")
@@ -192,6 +227,7 @@ class ChatSession:
                 sectors=self._sectors or None,
                 benchmarks=self._benchmarks,
                 factors=self._factors,
+                time_limit_s=pending.time_limit_s,
             )
         except InfeasibleError as e:
             return TurnResult(kind="error", text=str(e))

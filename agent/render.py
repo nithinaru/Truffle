@@ -106,7 +106,34 @@ def render_spec(spec: PortfolioSpec) -> str:
         lines.append("Constraints: (none)")
     lines.append("")
     lines.append(f"Problem class: {spec.problem_class.upper()}")
+    if spec.problem_class == "mip":
+        lines.extend(_mip_advisory(spec))
     return "\n".join(lines)
+
+
+def _mip_advisory(spec: PortfolioSpec) -> list[str]:
+    """Warn — before solving — that this is a mixed-integer problem.
+
+    Names the constraint that forced integrality, flags the longer solve, and
+    sets the expectation that shadow prices will be conditional on the selected
+    names. The chat loop appends a universe-size guard line on top of this when
+    the search space looks large.
+    """
+    causes = [
+        _constraint_phrase(c)
+        for c in spec.constraints
+        if type(c).problem_class_impact == "mip"
+    ]
+    cause_line = causes[0] if causes else "a mixed-integer constraint"
+    return [
+        "",
+        "⚠ This is a MIXED-INTEGER problem — caused by:",
+        f"    {cause_line}",
+        "  • It is solved by a mixed-integer solver (HiGHS for MILP, SCIP for",
+        "    MIQP), which can take noticeably longer than a convex solve.",
+        "  • Shadow prices will be CONDITIONAL on the selected names (computed by",
+        "    fixing the chosen names and re-solving), not global sensitivities.",
+    ]
 
 
 def render_patch(
