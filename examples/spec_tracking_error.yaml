@@ -1,0 +1,17 @@
+# TrackingErrorCap example: stay within 5% tracking error of a benchmark.
+# Requires benchmark weights as data (CLI: --benchmark examples/benchmark_sample.csv).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: min_variance
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: tracking_error_cap
+    id: te_cap
+    benchmark: bench
+    max_te: 0.05

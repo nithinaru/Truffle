@@ -1,0 +1,18 @@
+# FactorExposure example: keep net "value" factor exposure within [-0.1, 0.2].
+# Requires factor loadings as data (CLI: --factors examples/factors_sample.csv).
+universe: [AAA, BBB, CCC, DDD, EEE]
+
+objective:
+  kind: min_variance
+
+constraints:
+  - kind: budget
+    id: fully_invested
+    total: 1.0
+  - kind: long_only
+    id: no_shorts
+  - kind: factor_exposure
+    id: value_band
+    factor: value
+    min_exposure: -0.10
+    max_exposure: 0.20
