@@ -119,10 +119,16 @@ Truffle ships with a benchmark of hand-verified natural-language → spec pairs 
 
 ## Roadmap
 
+- [ ] **Cardinality / max-names limits** (big-M MIP) — the one modeling feature not yet shipped; everything else in *Features* above is implemented and tested.
 - [ ] Multi-period optimization (stochastic programming over scenario trees)
-- [ ] Factor-model risk (Fama–French exposure constraints)
+- [ ] Factor-model risk (Fama–French exposure constraints) — generic factor-exposure constraints ship today; named Fama–French factors are future work.
 - [ ] Black–Litterman view blending ("I think NVDA outperforms by 5%")
 - [ ] Robust optimization (uncertainty sets on expected returns)
+
+### Current limitations
+
+- **Max-Sharpe** uses the Charnes–Cooper transform and currently supports only `budget` + `long_only` + `box` constraints (and requires `long_only`). Combining it with group caps, turnover, transaction cost, tracking error, CVaR or factor constraints raises a clear error; use a min-variance / mean-variance / min-CVaR objective if you need those together. Transforming arbitrary constraints through the change of variables is future work.
+- **Risk parity** is solved standalone (the convex log-barrier surrogate, normalized); it does not yet compose with additional hard constraints.
 
 ## Disclaimer
 
