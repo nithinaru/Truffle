@@ -33,6 +33,7 @@ from core.ir import (
 )
 from core.report import SolutionReport, build_report
 from data.estimation import estimate_moments
+from data.inputs import align_named
 from data.scenarios import historical_scenarios
 
 SOLVER_NAME = "Clarabel"
@@ -63,22 +64,6 @@ def human_name_for(c: Constraint) -> str:
     if isinstance(c, FactorExposure):
         return f"the {c.factor} factor-exposure limit"
     return c.id  # fallback
-
-
-def _align_named_vectors(
-    named: dict[str, dict[str, float]] | None, universe: list[str]
-) -> dict[str, np.ndarray] | None:
-    """Align ``{name -> {ticker -> value}}`` maps to universe-ordered arrays.
-
-    Tickers absent from a given map default to 0.0. Returns ``None`` when no
-    maps were supplied so the compiler keeps its "input not provided" errors.
-    """
-    if not named:
-        return None
-    out: dict[str, np.ndarray] = {}
-    for name, by_ticker in named.items():
-        out[name] = np.array([float(by_ticker.get(t, 0.0)) for t in universe], dtype=float)
-    return out
 
 
 def solve_spec(
@@ -130,8 +115,8 @@ def solve_spec(
         scenarios=scenarios,
         w_prev=w_prev,
         sectors=sectors,
-        benchmark_weights=_align_named_vectors(benchmarks, spec.universe),
-        factor_loadings=_align_named_vectors(factors, spec.universe),
+        benchmark_weights=align_named(benchmarks, spec.universe, label="Benchmark"),
+        factor_loadings=align_named(factors, spec.universe, label="Factor"),
     )
     start = time.perf_counter()
     try:

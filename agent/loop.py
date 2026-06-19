@@ -89,10 +89,14 @@ class ChatSession:
         client: LLMClient,
         prices: pd.DataFrame,
         sectors: dict[str, str] | None = None,
+        benchmarks: dict[str, dict[str, float]] | None = None,
+        factors: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self._client = client
         self._prices = prices
         self._sectors = sectors or {}
+        self._benchmarks = benchmarks
+        self._factors = factors
         self.current_spec: PortfolioSpec | None = None
         self.pending: _Pending | None = None
 
@@ -182,7 +186,13 @@ class ChatSession:
         self.current_spec = pending.spec
 
         try:
-            _, report = solve_spec(pending.spec, self._prices)
+            _, report = solve_spec(
+                pending.spec,
+                self._prices,
+                sectors=self._sectors or None,
+                benchmarks=self._benchmarks,
+                factors=self._factors,
+            )
         except InfeasibleError as e:
             return TurnResult(kind="error", text=str(e))
         except UnboundedError as e:

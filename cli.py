@@ -11,22 +11,19 @@ prices) using Rich.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
-import cvxpy as cp
 import pandas as pd
 import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
 
-from core.compiler import compile_spec
-from core.duals import harvest_duals
-from core.exceptions import InfeasibleError, SolverError, TruffleError, UnboundedError
+from core.exceptions import InfeasibleError, SolverError, UnboundedError
 from core.ir import PortfolioSpec
 from core.report import SolutionReport
-from data.estimation import estimate_moments
+from core.solve import solve_spec
+from data.inputs import load_named_series, load_sectors
 
 app = typer.Typer(add_completion=False, help="Truffle: typed portfolio optimization.")
 console = Console()
@@ -70,18 +67,17 @@ def _render_weights(spec: PortfolioSpec, weights: list[float]) -> Table:
     return t
 
 
-def _render_duals(spec: PortfolioSpec, duals: dict[str, float]) -> Table:
-    t = Table(title="Shadow prices (binding constraints first)")
-    t.add_column("Constraint id", style="bold magenta")
-    t.add_column("Kind")
+def _render_binding(report: SolutionReport) -> Table:
+    t = Table(title="Binding constraints (shadow prices, largest first)")
+    t.add_column("Constraint", style="bold magenta")
     t.add_column("Shadow price", justify="right")
-    t.add_column("Binding?", justify="center")
-    kinds = {c.id: c.kind for c in spec.constraints}
-    rows = sorted(duals.items(), key=lambda kv: -abs(kv[1]))
-    for cid, sp in rows:
-        binding = "yes" if abs(sp) > 1e-6 else "no"
-        t.add_row(cid, kinds.get(cid, "?"), f"{sp:.6f}", binding)
+    for b in report.binding:
+        t.add_row(b.human_name, f"{b.shadow_price:.6f}")
     return t
+
+
+def _load_named(path: Path | None, *, label: str) -> dict[str, dict[str, float]] | None:
+    return None if path is None else load_named_series(path, label=label)
 
 
 @app.command()
@@ -89,6 +85,17 @@ def solve(
     spec_path: Path = typer.Argument(..., exists=True, readable=True, help="YAML spec file."),
     prices: Path = typer.Option(
         ..., "--prices", exists=True, readable=True, help="CSV of historical prices."
+    ),
+    sectors: Path | None = typer.Option(
+        None, "--sectors", exists=True, readable=True, help="ticker,sector CSV (for group caps)."
+    ),
+    benchmark: Path | None = typer.Option(
+        None, "--benchmark", exists=True, readable=True,
+        help="Wide ticker,<name> CSV of benchmark weights (tracking-error nodes).",
+    ),
+    factors: Path | None = typer.Option(
+        None, "--factors", exists=True, readable=True,
+        help="Wide ticker,<factor> CSV of factor loadings (factor-exposure nodes).",
     ),
 ) -> None:
     """Solve the portfolio problem described in ``spec_path`` against ``prices``."""
@@ -106,41 +113,37 @@ def solve(
     )
 
     price_df = _load_prices(prices, spec.universe)
-    mu, sigma = estimate_moments(price_df)
-
-    compiled = compile_spec(spec, mu, sigma)
-    start = time.perf_counter()
+    sector_map = load_sectors(sectors) if sectors is not None else None
     try:
-        compiled.problem.solve(solver=cp.CLARABEL)
-    except cp.SolverError as e:
-        raise SolverError(f"Clarabel failed: {e}") from e
-    elapsed_ms = 1000.0 * (time.perf_counter() - start)
+        _compiled, report = solve_spec(
+            spec,
+            price_df,
+            sectors=sector_map,
+            benchmarks=_load_named(benchmark, label="Benchmark"),
+            factors=_load_named(factors, label="Factor"),
+        )
+    except InfeasibleError as e:
+        console.print(f"[red]Problem is infeasible.[/red] {e}")
+        raise typer.Exit(code=3) from None
+    except UnboundedError as e:
+        console.print(f"[red]Problem is unbounded.[/red] {e}")
+        raise typer.Exit(code=4) from None
+    except (SolverError, ValueError) as e:
+        console.print(f"[red]Solve failed:[/red] {e}")
+        raise typer.Exit(code=5) from None
 
-    status = compiled.problem.status
-    if status in {"infeasible", "infeasible_inaccurate"}:
-        console.print(f"[red]Problem is infeasible[/red] (status: {status}).")
-        raise typer.Exit(code=3)
-    if status in {"unbounded", "unbounded_inaccurate"}:
-        console.print(f"[red]Problem is unbounded[/red] (status: {status}).")
-        raise typer.Exit(code=4)
-
-    weights = list(compiled.recovered_weights())
-    console.print(_render_weights(spec, weights))
-
+    console.print(_render_weights(spec, [report.weights[t] for t in spec.universe]))
+    var_line = f"  ·  VaR: {report.var:.6f}" if report.var is not None else ""
     console.print(
-        f"\n[bold]Objective value:[/bold] {compiled.problem.value:.6f}"
-        f"  ·  [bold]Solver:[/bold] Clarabel"
-        f"  ·  [bold]Status:[/bold] {status}"
-        f"  ·  [bold]Time:[/bold] {elapsed_ms:.1f} ms"
+        f"\n[bold]Objective value:[/bold] {report.objective_value:.6f}{var_line}"
+        f"  ·  [bold]Solver:[/bold] {report.solver}"
+        f"  ·  [bold]Status:[/bold] {report.status}"
+        f"  ·  [bold]Time:[/bold] {report.solve_time_ms:.1f} ms"
     )
-
-    try:
-        duals = harvest_duals(compiled)
-    except (InfeasibleError, UnboundedError, TruffleError) as e:
-        console.print(f"[yellow]Duals unavailable:[/yellow] {e}")
-        return
-
-    console.print(_render_duals(spec, duals))
+    if report.binding:
+        console.print(_render_binding(report))
+    else:
+        console.print("[dim]No constraints are binding at the optimum.[/dim]")
 
 
 def _render_solved(report: SolutionReport, explanation: str) -> None:
@@ -167,19 +170,12 @@ def _render_solved(report: SolutionReport, explanation: str) -> None:
     )
 
 
-def _load_sectors(path: Path | None) -> dict[str, str] | None:
-    if path is None:
-        return None
-    df = pd.read_csv(path)
-    if not {"ticker", "sector"}.issubset(df.columns):
-        raise SystemExit("--sectors CSV must have columns: ticker, sector.")
-    return dict(zip(df["ticker"], df["sector"], strict=True))
-
-
 @app.command()
 def chat(
     prices: Path = typer.Option(..., "--prices", exists=True, readable=True),
     sectors: Path | None = typer.Option(None, "--sectors", exists=True, readable=True),
+    benchmark: Path | None = typer.Option(None, "--benchmark", exists=True, readable=True),
+    factors: Path | None = typer.Option(None, "--factors", exists=True, readable=True),
 ) -> None:
     """Interactive natural-language session against ``--prices``."""
     # Local imports keep `solve` working without anthropic/loop dependencies
@@ -194,8 +190,14 @@ def chat(
         raise typer.Exit(code=2) from None
 
     price_df = pd.read_csv(prices, parse_dates=[0], index_col=0)
-    sector_map = _load_sectors(sectors)
-    session = ChatSession(client=client, prices=price_df, sectors=sector_map)
+    sector_map = load_sectors(sectors) if sectors is not None else None
+    session = ChatSession(
+        client=client,
+        prices=price_df,
+        sectors=sector_map,
+        benchmarks=_load_named(benchmark, label="Benchmark"),
+        factors=_load_named(factors, label="Factor"),
+    )
 
     console.print(
         "[bold]Truffle chat.[/bold] Tell me about the portfolio you want. "
