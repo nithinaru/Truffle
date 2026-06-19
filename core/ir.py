@@ -162,6 +162,17 @@ class PortfolioSpec(_IRModel):
     universe: list[str] = Field(min_length=1, description="Asset tickers; order is canonical.")
     objective: Objective
     constraints: list[Constraint] = Field(default_factory=list)
+    current_weights: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Pre-trade holdings as {ticker -> weight}, used by turnover and "
+            "transaction-cost terms. Convention: any universe ticker absent "
+            "from this mapping is treated as weight 0.0; None means the whole "
+            "vector is 0.0, i.e. the portfolio is being built fresh from cash "
+            "(full deployment). This is the single-shot input; per-rebalance "
+            "threading is a later sprint."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_semantics(self) -> PortfolioSpec:
@@ -186,7 +197,26 @@ class PortfolioSpec(_IRModel):
                     raise ValueError(
                         f"Box constraint {c.id} references tickers not in universe: {missing}."
                     )
+
+        # current_weights keys must be a subset of the universe — a weight on
+        # an unknown ticker is almost certainly a user/agent mistake we should
+        # surface, not silently drop.
+        if self.current_weights is not None:
+            unknown = sorted(set(self.current_weights) - universe_set)
+            if unknown:
+                raise ValueError(
+                    f"current_weights references tickers not in universe: {unknown}."
+                )
         return self
+
+    def w_prev_vector(self) -> list[float]:
+        """Return ``current_weights`` aligned to ``universe`` order.
+
+        Missing tickers (and the ``None`` case) resolve to ``0.0``, encoding
+        the "fresh from cash" convention documented on ``current_weights``.
+        """
+        cw = self.current_weights or {}
+        return [float(cw.get(t, 0.0)) for t in self.universe]
 
     @property
     def problem_class(self) -> ProblemClassImpact:
