@@ -9,6 +9,22 @@ The compiler also returns the dictionary ``constraint_objs`` that maps every
 IR constraint's ``id`` to its CVXPY ``Constraint`` object. :mod:`core.duals`
 walks that dict after the solve to lift shadow prices back into the IR's
 naming, which is the foundation of the explanation layer (BLUEPRINT §5/§6).
+
+Objective assembly (Sprint 3, Slice 0)
+--------------------------------------
+The final objective is **base objective + Σ(penalty terms)**. The base term
+comes from the :class:`~core.ir.Objective` node; penalty terms are contributed
+by *constraints* that modify the objective rather than adding a hard constraint
+(the canonical case is ``TransactionCost``). Penalty accumulation is explicit —
+constraints append to a local list that :func:`_assemble_objective` folds into
+the base — with no hidden global state.
+
+Reusable Rockafellar–Uryasev block (Slice 0)
+---------------------------------------------
+:func:`build_cvar_block` constructs the CVaR auxiliary variables ``t`` (VaR) and
+``z`` (per-scenario tail slacks) plus the linking inequality. It is used both by
+the ``MinCVaR`` *objective* and the ``CVaRLimit`` *constraint* so the LP
+reformulation lives in exactly one place.
 """
 
 from __future__ import annotations
@@ -32,7 +48,9 @@ class CompiledProblem:
         weights: The ``cp.Variable`` representing the asset weight vector.
         constraint_objs: ``{ir_constraint_id -> cvxpy.Constraint}``. Used by
             :mod:`core.duals` to recover shadow prices and name them back to
-            the user.
+            the user. Only *hard* constraints appear here — penalty-only nodes
+            (e.g. ``TransactionCost``) contribute to the objective and are
+            intentionally absent (they have no dual).
         spec: The originating ``PortfolioSpec`` (kept for downstream reporting).
         extra_vars: Objective-specific auxiliary variables. For ``min_cvar``
             this exposes ``{"t": <scalar Variable>, "z": <S-vector Variable>}``
@@ -65,19 +83,97 @@ def _validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> 
         )
 
 
-def _build_quad_objective(
+def _validate_scenarios(scenarios: np.ndarray | None, n: int) -> np.ndarray:
+    """Coerce and shape-check a scenario matrix for the Rockafellar–Uryasev LP.
+
+    Shared by the ``MinCVaR`` objective and the ``CVaRLimit`` constraint so the
+    error messages (and the contract) are identical at both call sites.
+    """
+    if scenarios is None:
+        raise CompilationError(
+            "min_cvar objective requires a scenario matrix; got scenarios=None. "
+            "Pass scenarios from data.scenarios.historical_scenarios(prices) (or another generator)."
+        )
+    scenarios = np.asarray(scenarios, dtype=float)
+    if scenarios.ndim != 2 or scenarios.shape[1] != n:
+        raise CompilationError(
+            f"Scenario matrix must have shape (S, {n}); got {scenarios.shape}."
+        )
+    if scenarios.shape[0] < 1:
+        raise CompilationError("Scenario matrix must have at least one scenario row.")
+    return scenarios
+
+
+def build_cvar_block(
+    scenarios: np.ndarray,
+    w: cp.Variable,
+    alpha: float,
+    *,
+    name_suffix: str = "",
+) -> tuple[cp.Expression, cp.Variable, cp.Variable, list[cp.Constraint]]:
+    """Build the Rockafellar–Uryasev CVaR block for weights ``w``.
+
+    For ``S`` equally-likely return scenarios (rows of ``scenarios``), portfolio
+    losses are ``L_s = -r_s · w`` and
+
+        CVaR_α(w) = min_t  t + (1/((1-α)S)) Σ_s max(L_s - t, 0).
+
+    Linearizing the ``max`` with non-negative slacks ``z_s`` gives the LP whose
+    auxiliary pieces this helper returns. The optimal ``t`` is the VaR.
+
+    Args:
+        scenarios: ``(S, n)`` return matrix (already validated/coerced).
+        w: weight variable of length ``n``.
+        alpha: CVaR confidence level in ``(0, 1)``.
+        name_suffix: appended to the ``t``/``z`` variable names so multiple
+            blocks (e.g. a ``MinCVaR`` objective plus one or more ``CVaRLimit``
+            constraints) coexist with distinct names.
+
+    Returns:
+        ``(cvar_expr, t_var, z_var, aux_constraints)`` — the scalar CVaR
+        expression, the VaR variable ``t``, the slack vector ``z``, and the
+        list of linking constraints (``z >= loss - t``) the caller must add to
+        the problem. ``z >= 0`` is encoded via ``nonneg=True``.
+    """
+    s = scenarios.shape[0]
+    t_var = cp.Variable(name=f"t{name_suffix}")
+    z_var = cp.Variable(s, name=f"z{name_suffix}", nonneg=True)
+    loss = -scenarios @ w
+    aux: list[cp.Constraint] = [z_var >= loss - t_var]
+    cvar_expr = t_var + cp.sum(z_var) / ((1.0 - alpha) * s)
+    return cvar_expr, t_var, z_var, aux
+
+
+def _build_quad_objective_expr(
     spec: PortfolioSpec, w: cp.Variable, mu: np.ndarray, sigma: np.ndarray
-) -> cp.Minimize:
+) -> cp.Expression:
     obj = spec.objective
     # `cp.psd_wrap` tells CVXPY to trust the matrix as PSD; the Ledoit–Wolf
     # estimator we use guarantees this, but a sample Σ on a tiny window can
     # be numerically indefinite, so wrapping is the safe contract.
     quad = cp.quad_form(w, cp.psd_wrap(sigma))
     if isinstance(obj, MinVariance):
-        return cp.Minimize(quad)
+        return quad
     if isinstance(obj, MeanVariance):
-        return cp.Minimize(quad - obj.risk_aversion * (mu @ w))
-    raise CompilationError(f"_build_quad_objective called on non-quadratic: {type(obj).__name__}")
+        return quad - obj.risk_aversion * (mu @ w)
+    raise CompilationError(
+        f"_build_quad_objective_expr called on non-quadratic: {type(obj).__name__}"
+    )
+
+
+def _assemble_objective(
+    base_expr: cp.Expression, penalties: list[cp.Expression]
+) -> cp.Minimize:
+    """Fold penalty terms into the base objective: ``min base + Σ penalties``.
+
+    Kept as a tiny named function so the "objective = base + penalties" law is
+    explicit and directly unit-testable, rather than inlined into the compile
+    flow where it would be invisible.
+    """
+    expr = base_expr
+    for term in penalties:
+        expr = expr + term
+    return cp.Minimize(expr)
 
 
 def _build_constraint(
@@ -142,39 +238,30 @@ def compile_spec(
     ticker_index = {t: i for i, t in enumerate(spec.universe)}
 
     constraint_objs: dict[str, cp.Constraint] = {}
+    hard_constraints: list[cp.Constraint] = []
     for c in spec.constraints:
-        constraint_objs[c.id] = _build_constraint(c, w, ticker_index)
+        cons = _build_constraint(c, w, ticker_index)
+        constraint_objs[c.id] = cons
+        hard_constraints.append(cons)
+
+    # Penalty terms contributed by constraints that modify the objective rather
+    # than adding a hard constraint. Empty until Slice 2's TransactionCost; the
+    # accumulation path is wired now so that feature is a pure addition.
+    penalties: list[cp.Expression] = []
 
     extra_vars: dict[str, cp.Variable] = {}
-    all_constraints = list(constraint_objs.values())
 
     obj = spec.objective
     if isinstance(obj, MinCVaR):
-        if scenarios is None:
-            raise CompilationError(
-                "min_cvar objective requires a scenario matrix; got scenarios=None. "
-                "Pass scenarios from data.scenarios.historical_scenarios(prices) (or another generator)."
-            )
-        scenarios = np.asarray(scenarios, dtype=float)
-        if scenarios.ndim != 2 or scenarios.shape[1] != n:
-            raise CompilationError(
-                f"Scenario matrix must have shape (S, {n}); got {scenarios.shape}."
-            )
-        s = scenarios.shape[0]
-        if s < 1:
-            raise CompilationError("Scenario matrix must have at least one scenario row.")
-        t_var = cp.Variable(name="t")  # = VaR at optimum
-        z_var = cp.Variable(s, name="z", nonneg=True)
-        # Rockafellar–Uryasev: losses are −r·w. We do NOT add `z >= 0` here
-        # separately because `nonneg=True` already encodes it (more efficient).
-        loss = -scenarios @ w
-        all_constraints = all_constraints + [z_var >= loss - t_var]
-        objective = cp.Minimize(t_var + cp.sum(z_var) / ((1.0 - obj.cvar_alpha) * s))
+        scenarios = _validate_scenarios(scenarios, n)
+        base_expr, t_var, z_var, aux = build_cvar_block(scenarios, w, obj.cvar_alpha)
+        hard_constraints = hard_constraints + aux
         extra_vars = {"t": t_var, "z": z_var}
     else:
-        objective = _build_quad_objective(spec, w, mu, sigma)
+        base_expr = _build_quad_objective_expr(spec, w, mu, sigma)
 
-    problem = cp.Problem(objective, all_constraints)
+    objective = _assemble_objective(base_expr, penalties)
+    problem = cp.Problem(objective, hard_constraints)
 
     return CompiledProblem(
         problem=problem,
