@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 
 import cvxpy as cp
+import numpy as np
 import pandas as pd
 
 from core.compiler import compile_spec
@@ -63,8 +64,10 @@ def solve_spec(spec: PortfolioSpec, prices: pd.DataFrame) -> tuple[object, Solut
     panel = prices[spec.universe]
     mu, sigma = estimate_moments(panel)
     scenarios = historical_scenarios(panel) if isinstance(spec.objective, MinCVaR) else None
+    # Single-shot pre-trade vector; absent holdings default to 0.0 ("from cash").
+    w_prev = np.asarray(spec.w_prev_vector(), dtype=float)
 
-    compiled = compile_spec(spec, mu=mu, sigma=sigma, scenarios=scenarios)
+    compiled = compile_spec(spec, mu=mu, sigma=sigma, scenarios=scenarios, w_prev=w_prev)
     start = time.perf_counter()
     try:
         compiled.problem.solve(solver=cp.CLARABEL)

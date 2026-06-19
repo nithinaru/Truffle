@@ -104,6 +104,24 @@ def _validate_scenarios(scenarios: np.ndarray | None, n: int) -> np.ndarray:
     return scenarios
 
 
+def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:
+    """Resolve the pre-trade weight vector used by turnover / transaction cost.
+
+    Convention (documented on :attr:`core.ir.PortfolioSpec.current_weights`):
+    ``None`` means a zero vector of length ``n`` — the portfolio is being built
+    fresh from cash, so every position change equals the target weight. A
+    supplied vector must already be aligned to the universe and length ``n``.
+    """
+    if w_prev is None:
+        return np.zeros(n, dtype=float)
+    w_prev = np.asarray(w_prev, dtype=float)
+    if w_prev.shape != (n,):
+        raise CompilationError(
+            f"w_prev vector shape {w_prev.shape} does not match universe size ({n},)."
+        )
+    return w_prev
+
+
 def build_cvar_block(
     scenarios: np.ndarray,
     w: cp.Variable,
@@ -177,8 +195,13 @@ def _assemble_objective(
 
 
 def _build_constraint(
-    c: Budget | LongOnly | Box, w: cp.Variable, ticker_index: dict[str, int]
+    c: Budget | LongOnly | Box,
+    w: cp.Variable,
+    ticker_index: dict[str, int],
+    w_prev: np.ndarray,
 ) -> cp.Constraint:
+    # w_prev is accepted uniformly so every builder has the same signature;
+    # Budget/LongOnly/Box do not reference it (Slice 2 nodes will).
     if isinstance(c, Budget):
         # Σ w = total. Stays an equality so its dual is a free-sign multiplier
         # — duals on equalities can be negative; the explanation layer
@@ -206,6 +229,7 @@ def compile_spec(
     mu: np.ndarray,
     sigma: np.ndarray,
     scenarios: np.ndarray | None = None,
+    w_prev: np.ndarray | None = None,
 ) -> CompiledProblem:
     """Deterministically build a CVXPY problem from an IR spec.
 
@@ -220,6 +244,9 @@ def compile_spec(
             CVaR objective only. ``None`` is allowed when the objective does
             not require scenarios; ``None`` with a ``min_cvar`` objective
             raises :class:`CompilationError`.
+        w_prev: Pre-trade weight vector aligned to ``spec.universe``, used by
+            turnover / transaction-cost terms. ``None`` resolves to the zero
+            vector ("fresh from cash"); see :func:`resolve_w_prev`.
 
     Returns:
         ``CompiledProblem`` wrapping the unsolved CVXPY problem, the weight
@@ -236,11 +263,15 @@ def compile_spec(
     n = len(spec.universe)
     w = cp.Variable(n, name="w")
     ticker_index = {t: i for i, t in enumerate(spec.universe)}
+    # Resolved once so every constraint builder sees the same pre-trade vector.
+    # Threaded into _build_constraint now; consumed by Slice 2's turnover /
+    # transaction-cost nodes.
+    w_prev_vec = resolve_w_prev(w_prev, n)
 
     constraint_objs: dict[str, cp.Constraint] = {}
     hard_constraints: list[cp.Constraint] = []
     for c in spec.constraints:
-        cons = _build_constraint(c, w, ticker_index)
+        cons = _build_constraint(c, w, ticker_index, w_prev_vec)
         constraint_objs[c.id] = cons
         hard_constraints.append(cons)
 
