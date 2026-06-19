@@ -67,6 +67,26 @@ pip install trufflefin
 export ANTHROPIC_API_KEY=...   # for the natural-language layer
 ```
 
+### Mixed-integer problems (cardinality limits)
+
+A "max N names" (cardinality) limit turns the problem mixed-integer. Two backends
+cover those, both free:
+
+- **MILP** (cardinality + min-CVaR) routes to **HiGHS**, which ships with cvxpy —
+  nothing extra to install.
+- **MIQP** (cardinality + min-variance / mean-variance) routes to **SCIP**
+  (Apache-2.0) via PySCIPOpt. Install it with:
+
+  ```bash
+  pip install trufflefin[mip]   # or: pip install pyscipopt
+  ```
+
+  The `pyscipopt` wheel bundles the SCIP binaries on common platforms, so a
+  separate system SCIP install is usually unnecessary. If the wheel can't build,
+  install SCIP from <https://www.scipopt.org/> first, then `pip install pyscipopt`.
+  If SCIP is missing when you solve a MIQP, Truffle raises a clear error telling
+  you which solver to install — it never silently falls back to a wrong backend.
+
 ## Quickstart
 
 ```bash

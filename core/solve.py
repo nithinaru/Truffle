@@ -32,11 +32,10 @@ from core.ir import (
     TurnoverCap,
 )
 from core.report import SolutionReport, build_report
+from core.routing import select_solver
 from data.estimation import estimate_moments
 from data.inputs import align_named
 from data.scenarios import historical_scenarios
-
-SOLVER_NAME = "Clarabel"
 
 
 def human_name_for(c: Constraint) -> str:
@@ -118,11 +117,12 @@ def solve_spec(
         benchmark_weights=align_named(benchmarks, spec.universe, label="Benchmark"),
         factor_loadings=align_named(factors, spec.universe, label="Factor"),
     )
+    choice = select_solver(spec)
     start = time.perf_counter()
     try:
-        compiled.problem.solve(solver=cp.CLARABEL)
+        compiled.problem.solve(solver=choice.cp_solver)
     except cp.SolverError as e:
-        raise SolverError(f"Clarabel failed: {e}") from e
+        raise SolverError(f"{choice.name} failed: {e}") from e
     elapsed_ms = 1000.0 * (time.perf_counter() - start)
 
     status = compiled.problem.status
@@ -155,7 +155,7 @@ def solve_spec(
         weights=weights,
         objective_kind=spec.objective.kind,
         objective_value=float(compiled.problem.value),
-        solver=SOLVER_NAME,
+        solver=choice.name,
         solve_time_ms=elapsed_ms,
         status=status,
         duals=duals,
