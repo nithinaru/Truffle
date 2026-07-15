@@ -14,10 +14,10 @@ from pydantic import Field, model_validator
 
 from core.compile_context import BuildContext
 from core.exceptions import CompilationError
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _new_id
 
 
-class GroupCap(_IRModel):
+class GroupCap(_ConstraintIRModel):
     """Cap (and optionally floor) the total weight of one group."""
 
     kind: Literal["group_cap"] = "group_cap"
@@ -28,6 +28,12 @@ class GroupCap(_IRModel):
         default=None, ge=0.0, le=1.0, description="Optional lower bound on Σ in-group weight."
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = True
+    big_m: ClassVar[float | None] = 1.0
+
+    @property
+    def slack_scale(self) -> float:
+        return self.max_weight
 
     @model_validator(mode="after")
     def _check_bounds(self) -> GroupCap:

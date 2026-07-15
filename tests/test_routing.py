@@ -14,12 +14,14 @@ import pytest
 from core.exceptions import CompilationError, SolverError
 from core.ir import (
     Budget,
+    Cardinality,
     LongOnly,
     MaxSharpe,
     MeanVariance,
     MinCVaR,
     MinVariance,
     PortfolioSpec,
+    TrackingErrorCap,
 )
 from core.routing import route_for, select_solver
 
@@ -51,6 +53,33 @@ def test_route_mip_quadratic_objective_goes_to_scip() -> None:
 
     # mean-variance is also quadratic => MIQP.
     assert route_for("mip", MeanVariance(risk_aversion=1.0)).cp_solver == cp.SCIP
+
+
+def test_route_cardinality_plus_tracking_error_cap_goes_to_scip_misocp(
+    monkeypatch,
+) -> None:
+    choice = route_for(
+        "mip",
+        MinCVaR(cvar_alpha=0.95),
+        has_tracking_error_cap=True,
+    )
+    assert choice.cp_solver == cp.SCIP
+    assert choice.name == "SCIP"
+    assert choice.problem_form == "MISOCP"
+    assert choice.is_mip is True
+
+    monkeypatch.setattr(cp, "installed_solvers", lambda: [cp.CLARABEL, cp.HIGHS, cp.SCIP])
+    spec = PortfolioSpec(
+        universe=["AAA", "BBB", "CCC"],
+        objective=MinCVaR(cvar_alpha=0.95),
+        constraints=[
+            Budget(),
+            LongOnly(),
+            Cardinality(max_names=2),
+            TrackingErrorCap(benchmark="bench", max_te=0.05),
+        ],
+    )
+    assert select_solver(spec).problem_form == "MISOCP"
 
 
 def test_route_mip_unsupported_objective_raises() -> None:

@@ -27,10 +27,13 @@ class SolverError(TruffleError):
 class InfeasibleError(SolverError):
     """Raised when the solver reports the problem is infeasible.
 
-    Sprint-3 will replace bare raises of this with an elastic relaxation
-    diagnosis. For now we surface the solver status verbatim so the user
-    knows which constraints to suspect.
+    Callers may opt into diagnosis, in which case ``conflict_report`` carries
+    the deterministic elastic/IIS result and verified repair candidates.
     """
+
+    def __init__(self, message: str, *, conflict_report: object | None = None) -> None:
+        super().__init__(message)
+        self.conflict_report = conflict_report
 
 
 class UnboundedError(SolverError):
@@ -52,3 +55,7 @@ class GroundingFailedError(TruffleError):
     """Raised when an LLM-generated explanation contains numerals that are
     not present in the SolutionReport, even after one repair attempt. The
     chat loop falls back to a deterministic template summary."""
+
+
+class DiagnosisError(TruffleError):
+    """Raised when diagnosis is inapplicable or cannot prove a safe result."""

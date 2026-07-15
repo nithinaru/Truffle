@@ -20,6 +20,8 @@ from core.ir import (
     MinVariance,
     PortfolioSpec,
 )
+from core.patch import SpecPatch as CoreSpecPatch
+from core.patch import apply_patch as core_apply_patch
 
 
 def _base_spec() -> PortfolioSpec:
@@ -80,6 +82,11 @@ def test_envelope_dispatches_spec_patch() -> None:
     assert isinstance(env.result.replace_objective, MinCVaR)
 
 
+def test_agent_schema_reexports_core_patch_api() -> None:
+    assert SpecPatch is CoreSpecPatch
+    assert apply_patch is core_apply_patch
+
+
 def test_empty_spec_patch_rejected() -> None:
     with pytest.raises(ValueError, match="SpecPatch is empty"):
         SpecPatch()
@@ -90,14 +97,29 @@ def test_apply_patch_removes_then_replaces_then_adds() -> None:
     patch = SpecPatch(
         remove_constraint_ids=["cap_aaa"],
         replace_objective=MeanVariance(risk_aversion=2.0),
-        add_constraints=[Box(id="cap_all", lower=0.0, upper=0.4)],
+        add_constraints=[Box(id="cap_aaa", lower=0.0, upper=0.4)],
     )
     new_spec = apply_patch(spec, patch)
     assert isinstance(new_spec.objective, MeanVariance)
-    ids = [c.id for c in new_spec.constraints]
-    assert "cap_aaa" not in ids
-    assert "cap_all" in ids
-    assert "b" in ids and "lo" in ids
+    assert [constraint.id for constraint in new_spec.constraints] == ["b", "lo", "cap_aaa"]
+    assert isinstance(new_spec.constraints[-1], Box)
+    assert new_spec.constraints[-1].upper == 0.4
+
+
+def test_apply_patch_preserves_current_weights() -> None:
+    spec = PortfolioSpec(
+        universe=["AAA", "BBB", "CCC"],
+        objective=MinVariance(),
+        constraints=[Budget(id="b"), LongOnly(id="lo")],
+        current_weights={"AAA": 0.6, "BBB": 0.3, "CCC": 0.1},
+    )
+
+    new_spec = apply_patch(
+        spec,
+        SpecPatch(replace_objective=MeanVariance(risk_aversion=2.0)),
+    )
+
+    assert new_spec.current_weights == spec.current_weights
 
 
 def test_apply_patch_universe_swap() -> None:
@@ -110,6 +132,21 @@ def test_apply_patch_universe_swap() -> None:
     )
     new_spec = apply_patch(spec, patch)
     assert new_spec.universe == ["XXX", "YYY"]
+
+
+def test_apply_patch_universe_swap_liquidates_removed_holdings() -> None:
+    spec = PortfolioSpec(
+        universe=["AAA", "BBB", "CCC"],
+        objective=MinVariance(),
+        constraints=[Budget(id="b"), LongOnly(id="lo")],
+        current_weights={"AAA": 0.6, "BBB": 0.3, "CCC": 0.1},
+    )
+
+    new_spec = apply_patch(spec, SpecPatch(set_universe=["BBB", "DDD"]))
+
+    assert new_spec.universe == ["BBB", "DDD"]
+    assert new_spec.current_weights == {"BBB": 0.3}
+    assert new_spec.w_prev_vector() == [0.3, 0.0]
 
 
 def test_clarification_rejects_empty_question() -> None:

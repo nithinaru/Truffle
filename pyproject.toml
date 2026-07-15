@@ -23,14 +23,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+agent = [
+    "anthropic>=0.40",
+]
+alpaca-data = [
+    "httpx>=0.28,<1",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
 ]
 # Mixed-integer quadratic programs (cardinality + a variance/mean-variance
-# objective) route to SCIP via cvxpy's PySCIPOpt interface. Apache-2.0, free;
+# objective, or cardinality + a tracking-error cone) route to SCIP via
+# cvxpy's PySCIPOpt interface. Apache-2.0, free;
 # the wheel bundles the SCIP binaries. MILPs (cardinality + min-CVaR) use HiGHS,
-# which already ships with cvxpy, so this extra is only needed for the MIQP path.
+# which already ships with cvxpy, so this extra is only needed for MIQP/MISOCP.
 mip = [
     "pyscipopt>=5.0",
 ]
@@ -42,8 +49,12 @@ truffle = "cli:app"
 py-modules = ["cli"]
 
 [tool.setuptools.packages.find]
-include = ["core*", "data*"]
+include = ["agent*", "backtest*", "core*", "data*", "evaluation*", "paper*", "truffle*"]
 exclude = ["tests*", "examples*"]
+
+[tool.setuptools.package-data]
+agent = ["prompts/*.md"]
+evaluation = ["benchmark.jsonl"]
 
 [tool.ruff]
 line-length = 100

@@ -86,6 +86,15 @@ def _constraint_phrase(c: Constraint) -> str:
     raise AssertionError(f"Unknown constraint kind: {type(c).__name__}")
 
 
+def _constraint_phrase_with_policy(c: Constraint) -> str:
+    """Render the constraint plus any user-declared diagnosis policy."""
+
+    phrase = _constraint_phrase(c)
+    if c.elastic is False and type(c).elastic_default:
+        return f"{phrase}  [non-negotiable during diagnosis]"
+    return phrase
+
+
 def render_spec(spec: PortfolioSpec) -> str:
     """Plain-text confirmation block for the spec echo.
 
@@ -101,7 +110,7 @@ def render_spec(spec: PortfolioSpec) -> str:
     if spec.constraints:
         lines.append("Constraints:")
         for c in spec.constraints:
-            lines.append(f"  • {_constraint_phrase(c)}")
+            lines.append(f"  • {_constraint_phrase_with_policy(c)}")
     else:
         lines.append("Constraints: (none)")
     lines.append("")
@@ -120,7 +129,7 @@ def _mip_advisory(spec: PortfolioSpec) -> list[str]:
     the search space looks large.
     """
     causes = [
-        _constraint_phrase(c)
+        _constraint_phrase_with_policy(c)
         for c in spec.constraints
         if type(c).problem_class_impact == "mip"
     ]
@@ -130,7 +139,7 @@ def _mip_advisory(spec: PortfolioSpec) -> list[str]:
         "⚠ This is a MIXED-INTEGER problem — caused by:",
         f"    {cause_line}",
         "  • It is solved by a mixed-integer solver (HiGHS for MILP, SCIP for",
-        "    MIQP), which can take noticeably longer than a convex solve.",
+        "    MIQP/MISOCP), which can take noticeably longer than a convex solve.",
         "  • Shadow prices will be CONDITIONAL on the selected names (computed by",
         "    fixing the chosen names and re-solving), not global sensitivities.",
     ]
@@ -162,7 +171,7 @@ def render_patch(
     for cid in patch.remove_constraint_ids:
         lines.append(f"  • Removed constraint: {cid}")
     for c in patch.add_constraints:
-        lines.append(f"  • Added constraint: {_constraint_phrase(c)}")
+        lines.append(f"  • Added constraint: {_constraint_phrase_with_policy(c)}")
     if patch.set_universe is not None:
         lines.append(
             f"  • Universe: {len(before.universe)} → {len(after.universe)} tickers "

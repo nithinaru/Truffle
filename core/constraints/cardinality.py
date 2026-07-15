@@ -18,16 +18,22 @@ defaulting to ``1.0`` when no tighter cap exists — valid because a fully
 invested long-only book has every ``w_i ≤ 1``. A tighter M is not just cosmetic:
 it shrinks the LP relaxation gap and speeds the branch-and-bound search.
 
-The formulation assumes long-only weights; the linking constraint only pins the
-*upper* side (``w_i ≤ M_i y_i``), which together with ``w_i ≥ 0`` forces an
-unselected weight to zero. A spec that allowed shorting would also need a lower
-big-M; that is out of scope here (cardinality pairs with long-only books).
+Production compilation requires long-only, fully invested weights. Diagnostic
+deletion trials may temporarily remove one of those domain rows; when that
+happens the diagnoser derives finite per-name lower and upper bounds from the
+remaining continuous system and supplies a two-sided selection link. It never
+uses an unjustified ``M=1`` infeasibility result as proof.
 
-This node contributes no usable dual of its own (integer programs have no
-shadow prices — see :mod:`core.duals` and the fix-and-resolve path), so its
-builder returns ``None`` and pushes its hard constraints onto the context's
-``aux_constraints``, storing the selection vector ``y`` in ``extra_vars`` so the
-solve layer can read the optimal selection ``y*``.
+This node contributes no usable MIP dual of its own (integer programs have no
+shadow prices — see :mod:`core.duals` and the fix-and-resolve path). Its builder
+returns the count cap as the named constraint so diagnosis can elasticize it,
+pushes the linking/floor rows onto ``aux_constraints``, and stores the selection
+vector ``y`` in ``extra_vars`` so the solve layer can read ``y*``.
+
+Only a max-only Cardinality instance is elastic in Sprint 5.  When
+``min_names`` or ``min_position`` is present, the node contains lower rows that
+the scalar max-cap slack does not relax.  Such an instance is therefore
+structural during diagnosis rather than being mislabeled as repairable.
 """
 
 from __future__ import annotations
@@ -39,10 +45,10 @@ import numpy as np
 from pydantic import Field, model_validator
 
 from core.compile_context import BuildContext
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _new_id
 
 
-class Cardinality(_IRModel):
+class Cardinality(_ConstraintIRModel):
     """At most ``max_names`` (optionally at least ``min_names``) held positions.
 
     Attributes:
@@ -69,6 +75,23 @@ class Cardinality(_IRModel):
         description="Optional minimum weight for a held name (no dust positions).",
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "mip"
+    elastic_default: ClassVar[bool] = True
+
+    @property
+    def elasticity_supported(self) -> bool:
+        """True only when relaxing ``max_names`` relaxes the whole node."""
+
+        return self.min_names is None and self.min_position is None
+
+    @property
+    def slack_scale(self) -> float:
+        return float(self.max_names)
+
+    def diagnostic_big_m(self, universe_size: int | None = None) -> float:
+        """A cardinality cap is vacuous at the full universe size."""
+        if universe_size is None or universe_size < 1:
+            raise ValueError("Cardinality diagnostic_big_m requires a positive universe_size.")
+        return float(universe_size)
 
     @model_validator(mode="after")
     def _check_counts(self) -> Cardinality:
@@ -76,35 +99,47 @@ class Cardinality(_IRModel):
             raise ValueError(
                 f"Cardinality min_names={self.min_names} > max_names={self.max_names}."
             )
+        if self.elastic is True and not self.elasticity_supported:
+            raise ValueError(
+                "Cardinality is elastic only in its max_names-only form; "
+                "min_names/min_position rows are structural during diagnosis."
+            )
         return self
 
 
-def build(node: Cardinality, ctx: BuildContext) -> None:
+def build(node: Cardinality, ctx: BuildContext) -> cp.Constraint:
     """Add the binary-selection cardinality constraints to ``ctx``.
 
-    Returns ``None`` (no named dual-carrying constraint): a MIP has no duals, so
-    the cardinality node never appears in the ``{id -> Constraint}`` map. The
-    hard constraints go onto ``ctx.aux_constraints`` and the selection vector is
-    exposed as ``ctx.extra_vars["y"]`` for the fix-and-resolve dual path.
+    The max-name row is returned as the node's named constraint so the
+    diagnostic compiler can replace it with ``sum(y) <= K + slack``. It still
+    has no MIP dual; ordinary MIP reporting uses fix-and-resolve and drops the
+    whole Cardinality node before harvesting continuous duals.
     """
     n = ctx.n
-    # Per-asset big-M = the position upper bound (≤ 1). Falls back to 1.0.
+    # Per-asset big-M = the position upper bound (≤ 1 in production).
     if ctx.weight_upper is not None:
         big_m = np.asarray(ctx.weight_upper, dtype=float)
     else:
         big_m = np.ones(n, dtype=float)
+    lower_m = (
+        np.asarray(ctx.weight_lower, dtype=float)
+        if ctx.weight_lower is not None
+        else np.zeros(n, dtype=float)
+    )
 
     y = cp.Variable(n, boolean=True, name="y")
     ctx.extra_vars["y"] = y
 
-    # Not-selected ⇒ weight pinned to 0 (with long-only w ≥ 0). Selected ⇒
-    # weight may reach its cap.
+    # Two-sided links pin an unselected name to zero. Production lower bounds
+    # are zero; diagnostic counterfactuals can carry rigorously derived signed
+    # bounds after LongOnly or Budget is removed.
     ctx.aux_constraints.append(ctx.w <= cp.multiply(big_m, y))
-    # The defining count cap.
-    ctx.aux_constraints.append(cp.sum(y) <= node.max_names)
+    ctx.aux_constraints.append(ctx.w >= cp.multiply(lower_m, y))
+    # The defining count cap is the one elastic component for this sprint.
+    count_cap = cp.sum(y) <= node.max_names
     if node.min_names is not None:
         ctx.aux_constraints.append(cp.sum(y) >= node.min_names)
     if node.min_position is not None:
         # A held name carries at least min_position; an unheld one stays 0.
         ctx.aux_constraints.append(ctx.w >= node.min_position * y)
-    return None
+    return count_cap

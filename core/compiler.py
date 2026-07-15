@@ -29,6 +29,7 @@ reformulation lives in exactly one place.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 
 import cvxpy as cp
@@ -92,22 +93,58 @@ _CONSTRAINT_BUILDERS: dict[type, Callable[..., cp.Constraint | None]] = {
 }
 
 
-def _weight_upper_bounds(spec: PortfolioSpec, ticker_index: dict[str, int]) -> np.ndarray:
+def _cardinality_domain_is_bounded(spec: PortfolioSpec) -> bool:
+    """Whether Cardinality's production ``[0, 1]`` links are mathematically valid.
+
+    The current formulation relies on ``w >= 0`` and ``sum(w) == 1`` to imply
+    ``w_i <= 1``.  Treat those rows as explicit compiler preconditions rather
+    than silently assuming them for arbitrary specs.
+    """
+
+    if not any(isinstance(c, Cardinality) for c in spec.constraints):
+        return True
+    has_long_only = any(isinstance(c, LongOnly) for c in spec.constraints)
+    has_unit_budget = any(
+        isinstance(c, Budget) and math.isclose(c.total, 1.0, rel_tol=0.0, abs_tol=1e-12)
+        for c in spec.constraints
+    )
+    return has_long_only and has_unit_budget
+
+
+def _validate_cardinality_domain(spec: PortfolioSpec) -> None:
+    if not _cardinality_domain_is_bounded(spec):
+        raise CompilationError(
+            "Cardinality currently requires both LongOnly and Budget(total=1.0). "
+            "Those constraints prove 0 <= w_i <= 1, which makes its selection "
+            "links valid."
+        )
+
+
+def _weight_upper_bounds(
+    spec: PortfolioSpec,
+    ticker_index: dict[str, int],
+    relaxed_constraint_ids: frozenset[str] = frozenset(),
+    base_upper: np.ndarray | None = None,
+) -> np.ndarray:
     """Per-asset weight upper bounds from Box nodes, default 1.0.
 
     Used as the cardinality big-M: the tightest known cap on each ``w_i`` is a
     valid (and tight) M for the ``w_i ≤ M_i · y_i`` linking constraint.
     """
     n = len(spec.universe)
-    ub = np.ones(n, dtype=float)
-    for c in spec.constraints:
-        if not isinstance(c, Box):
-            continue
-        idx = (
-            range(n)
-            if c.tickers is None
-            else [ticker_index[t] for t in c.tickers]
+    ub = (
+        np.ones(n, dtype=float)
+        if base_upper is None
+        else np.asarray(base_upper, dtype=float).copy()
+    )
+    if ub.shape != (n,) or not np.all(np.isfinite(ub)):
+        raise CompilationError(
+            "Cardinality upper bounds must be a finite vector aligned to universe."
         )
+    for c in spec.constraints:
+        if not isinstance(c, Box) or c.id in relaxed_constraint_ids:
+            continue
+        idx = range(n) if c.tickers is None else [ticker_index[t] for t in c.tickers]
         for i in idx:
             ub[i] = min(ub[i], c.upper)
     return ub
@@ -130,9 +167,7 @@ def _build_quad_objective_expr(
     )
 
 
-def _assemble_objective(
-    base_expr: cp.Expression, penalties: list[cp.Expression]
-) -> cp.Minimize:
+def _assemble_objective(base_expr: cp.Expression, penalties: list[cp.Expression]) -> cp.Minimize:
     """Fold penalty terms into the base objective: ``min base + Σ penalties``.
 
     Kept as a tiny named function so the "objective = base + penalties" law is
@@ -184,6 +219,10 @@ def compile_spec(
     sectors: dict[str, str] | None = None,
     benchmark_weights: dict[str, np.ndarray] | None = None,
     factor_loadings: dict[str, np.ndarray] | None = None,
+    *,
+    relaxed_constraint_ids: frozenset[str] = frozenset(),
+    _validate_cardinality_preconditions: bool = True,
+    _cardinality_weight_bounds: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> CompiledProblem:
     """Deterministically build a CVXPY problem from an IR spec.
 
@@ -218,6 +257,8 @@ def compile_spec(
             objective/constraint kind the compiler does not understand.
     """
     validate_inputs(spec, mu, sigma)
+    if _validate_cardinality_preconditions and _cardinality_weight_bounds is None:
+        _validate_cardinality_domain(spec)
 
     # Change-of-variable objectives build their own transformed problem (they do
     # not optimize over w directly) and return early with a weight-recovery hook.
@@ -232,6 +273,23 @@ def compile_spec(
     # Resolved once so every constraint builder sees the same pre-trade vector.
     w_prev_vec = resolve_w_prev(w_prev, n)
 
+    if _cardinality_weight_bounds is None:
+        cardinality_lower = np.zeros(n, dtype=float)
+        cardinality_upper = None
+    else:
+        cardinality_lower = np.asarray(_cardinality_weight_bounds[0], dtype=float)
+        cardinality_upper = np.asarray(_cardinality_weight_bounds[1], dtype=float)
+        if (
+            cardinality_lower.shape != (n,)
+            or cardinality_upper.shape != (n,)
+            or not np.all(np.isfinite(cardinality_lower))
+            or not np.all(np.isfinite(cardinality_upper))
+            or np.any(cardinality_lower > cardinality_upper)
+        ):
+            raise CompilationError(
+                "Cardinality diagnostic bounds must be finite aligned lower/upper vectors."
+            )
+
     ctx = BuildContext(
         w=w,
         n=n,
@@ -242,7 +300,16 @@ def compile_spec(
         group_map=sectors,
         benchmark_weights=benchmark_weights,
         factor_loadings=factor_loadings,
-        weight_upper=_weight_upper_bounds(spec, ticker_index),
+        # A relaxed Box must not remain hidden inside Cardinality's big-M.
+        # Diagnosis passes its relaxed ids here so the link uses the structural
+        # long-only bound (1.0) instead of preserving the cap being relaxed.
+        weight_upper=_weight_upper_bounds(
+            spec,
+            ticker_index,
+            relaxed_constraint_ids,
+            cardinality_upper,
+        ),
+        weight_lower=cardinality_lower,
     )
 
     constraint_objs: dict[str, cp.Constraint] = {}

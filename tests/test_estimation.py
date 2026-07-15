@@ -73,3 +73,12 @@ def test_rejects_non_positive_prices() -> None:
 def test_rejects_single_observation() -> None:
     with pytest.raises(ValueError, match="at least 2"):
         estimate_moments(pd.DataFrame({"A": [10.0]}))
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
+def test_rejects_invalid_annualization_counts(value: object) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        estimate_moments(
+            pd.DataFrame({"A": [10.0, 11.0]}),
+            periods_per_year=value,  # type: ignore[arg-type]
+        )

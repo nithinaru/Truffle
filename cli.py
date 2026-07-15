@@ -12,6 +12,7 @@ prices) using Rich.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 import typer
@@ -21,7 +22,7 @@ from rich.table import Table
 
 from core.exceptions import InfeasibleError, SolverError, UnboundedError
 from core.ir import PortfolioSpec
-from core.report import SolutionReport
+from core.report import ConflictReport, SolutionReport
 from core.solve import solve_spec
 from data.inputs import load_named_series, load_sectors
 
@@ -97,6 +98,11 @@ def solve(
         None, "--factors", exists=True, readable=True,
         help="Wide ticker,<factor> CSV of factor loadings (factor-exposure nodes).",
     ),
+    diagnose: bool = typer.Option(
+        False,
+        "--diagnose/--no-diagnose",
+        help="On infeasibility, run deterministic conflict analysis and show verified repairs.",
+    ),
 ) -> None:
     """Solve the portfolio problem described in ``spec_path`` against ``prices``."""
     try:
@@ -121,9 +127,21 @@ def solve(
             sectors=sector_map,
             benchmarks=_load_named(benchmark, label="Benchmark"),
             factors=_load_named(factors, label="Factor"),
+            diagnose=diagnose,
         )
     except InfeasibleError as e:
         console.print(f"[red]Problem is infeasible.[/red] {e}")
+        if diagnose and isinstance(e.conflict_report, ConflictReport):
+            _render_conflict(
+                _deterministic_conflict_summary(e.conflict_report),
+                e.conflict_report,
+                interactive=False,
+            )
+        elif not diagnose:
+            console.print(
+                "[dim]Re-run with --diagnose to identify the conflicting constraints "
+                "and show verified repairs.[/dim]"
+            )
         raise typer.Exit(code=3) from None
     except UnboundedError as e:
         console.print(f"[red]Problem is unbounded.[/red] {e}")
@@ -187,6 +205,207 @@ def _render_solved(report: SolutionReport, explanation: str) -> None:
         f"[dim]objective = {report.objective_value:.6f}{var_line}  ·  "
         f"solver = {report.solver}  ·  time = {report.solve_time_ms:.1f} ms[/dim]"
     )
+
+
+def _render_backtest(sheet: object) -> None:
+    """Render a compact deterministic tearsheet summary."""
+    from backtest.tearsheet import Tearsheet  # noqa: PLC0415
+
+    if not isinstance(sheet, Tearsheet):
+        return
+    summary = sheet.summary
+    table = Table(title=f"Walk-forward results · {sheet.start_date} to {sheet.end_date}")
+    table.add_column("Series", style="bold cyan")
+    table.add_column("Total", justify="right")
+    table.add_column("Annualized", justify="right")
+    table.add_column("Volatility", justify="right")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("Max drawdown", justify="right")
+    rows = [
+        ("Truffle (net)", summary.strategy),
+        ("Truffle (gross)", summary.strategy_gross),
+        ("Equal weight (net)", summary.equal_weight),
+    ]
+    if summary.market is not None:
+        rows.append(("Market (gross)", summary.market))
+    for label, metrics in rows:
+        sharpe = "n/a" if metrics.sharpe is None else f"{metrics.sharpe:.3f}"
+        table.add_row(
+            label,
+            f"{100.0 * metrics.total_return:.2f}%",
+            f"{100.0 * metrics.annualized_return:.2f}%",
+            f"{100.0 * metrics.annualized_volatility:.2f}%",
+            sharpe,
+            f"{100.0 * metrics.max_drawdown:.2f}%",
+        )
+    console.print(table)
+    modeled = summary.holding_weighted_modeled_cvar
+    realized = summary.holding_weighted_realized_cvar
+    modeled_text = "n/a" if modeled is None else f"{100.0 * modeled:.3f}%"
+    realized_text = "n/a" if realized is None else f"{100.0 * realized:.3f}%"
+    console.print(
+        f"[bold]Rebalances:[/bold] {len(sheet.rebalances)}  ·  "
+        f"[bold]L1 turnover:[/bold] {summary.total_turnover:.3f}  ·  "
+        f"[bold]Cost paid:[/bold] {100.0 * summary.total_cost_paid:.3f}% initial NAV  ·  "
+        f"[bold]Cost drag:[/bold] {100.0 * summary.cost_drag:.3f}%"
+    )
+    console.print(
+        f"[bold]Holding-weighted CVaR:[/bold] modeled {modeled_text}  ·  "
+        f"realized {realized_text}  ·  alpha={sheet.config.cvar_alpha:g}"
+    )
+
+
+def _load_market_prices(path: Path, column: str | None) -> pd.Series:
+    frame = pd.read_csv(path, parse_dates=[0], index_col=0)
+    if column is None:
+        if len(frame.columns) != 1:
+            raise ValueError(
+                "Market prices CSV has multiple value columns; pass --market-column."
+            )
+        column = str(frame.columns[0])
+    if column not in frame.columns:
+        raise ValueError(
+            f"Market prices CSV has no column {column!r}; columns are {list(frame.columns)}."
+        )
+    return frame[column]
+
+
+@app.command("backtest")
+def backtest_command(
+    spec_path: Path = typer.Argument(..., exists=True, readable=True, help="YAML spec file."),
+    prices: Path = typer.Option(
+        ..., "--prices", exists=True, readable=True, help="CSV of adjusted historical closes."
+    ),
+    lookback: int = typer.Option(252, "--lookback", min=2, help="Trailing return observations."),
+    rebalance: Literal["weekly", "monthly", "quarterly"] = typer.Option(
+        "monthly", "--rebalance", help="Calendar rebalance frequency."
+    ),
+    cost_bps: float | None = typer.Option(
+        None,
+        "--cost-bps",
+        min=0.0,
+        help="Execution cost per unit of L1 turnover; defaults to spec cost nodes.",
+    ),
+    periods_per_year: int = typer.Option(252, "--periods-per-year", min=1),
+    cvar_alpha: float = typer.Option(0.95, "--cvar-alpha", min=0.000001, max=0.999999),
+    risk_free_rate: float = typer.Option(0.0, "--risk-free-rate", min=-0.999999),
+    market_prices: Path | None = typer.Option(
+        None,
+        "--market-prices",
+        exists=True,
+        readable=True,
+        help="Optional local CSV for a gross market/SPY baseline.",
+    ),
+    market_column: str | None = typer.Option(None, "--market-column"),
+    sectors: Path | None = typer.Option(None, "--sectors", exists=True, readable=True),
+    benchmark: Path | None = typer.Option(None, "--benchmark", exists=True, readable=True),
+    factors: Path | None = typer.Option(None, "--factors", exists=True, readable=True),
+    json_out: Path | None = typer.Option(
+        None,
+        "--json-out",
+        help="Write the complete deterministic tearsheet JSON to this path.",
+    ),
+) -> None:
+    """Run a delayed-fill, no-lookahead walk-forward backtest."""
+    from backtest import BacktestConfig, BacktestError, run_backtest  # noqa: PLC0415
+
+    try:
+        spec = _load_spec(spec_path)
+        panel = _load_prices(prices, spec.universe)
+        config = BacktestConfig(
+            lookback_returns=lookback,
+            rebalance_frequency=rebalance,
+            periods_per_year=periods_per_year,
+            cvar_alpha=cvar_alpha,
+            execution_cost_bps=cost_bps,
+            annual_risk_free_rate=risk_free_rate,
+        )
+        market = (
+            None
+            if market_prices is None
+            else _load_market_prices(market_prices, market_column)
+        )
+        sheet = run_backtest(
+            spec,
+            panel,
+            config=config,
+            sectors=load_sectors(sectors) if sectors is not None else None,
+            benchmarks=_load_named(benchmark, label="Benchmark"),
+            factors=_load_named(factors, label="Factor"),
+            market_prices=market,
+        )
+    except (BacktestError, SolverError, ValueError) as exc:
+        console.print(f"[red]Backtest failed:[/red] {exc}")
+        raise typer.Exit(code=6) from None
+
+    _render_backtest(sheet)
+    if json_out is not None:
+        json_out.write_text(sheet.model_dump_json(indent=2), encoding="utf-8")
+        console.print(f"[dim]Wrote deterministic tearsheet JSON to {json_out}.[/dim]")
+
+
+def _deterministic_conflict_summary(report: ConflictReport) -> str:
+    """Describe a diagnosis using only trusted fields from ``report``."""
+    names = ", ".join(member.human_name for member in report.conflict_set)
+    if report.minimality_status == "verified_iis":
+        opening = f"The verified irreducible conflict contains: {names}."
+    else:
+        opening = (
+            "These constraints appear to conflict, but minimality was not "
+            f"verified: {names}."
+        )
+
+    parts = [opening]
+    parts.extend(evidence.text for evidence in report.evidence)
+    structural = [
+        member.human_name
+        for member in report.conflict_set
+        if member.relaxability != "relaxable"
+    ]
+    if structural:
+        parts.append(
+            "The conflict includes structural or non-negotiable constraints: "
+            + ", ".join(structural)
+            + "."
+        )
+    if report.repairs:
+        choices = " ".join(
+            f"{repair.rank}. {repair.description}" for repair in report.repairs
+        )
+        parts.append("Verified repair options: " + choices)
+    else:
+        parts.append("No verified single-change repair is available from this diagnosis.")
+    return " ".join(parts)
+
+
+def _render_conflict(
+    explanation: str,
+    report: object,
+    *,
+    interactive: bool = True,
+) -> None:
+    """Render a grounded conflict explanation and verified repair choices."""
+    if not isinstance(report, ConflictReport):
+        return
+    console.print(f"\n[bold red]Constraints conflict[/bold red]\n{explanation}\n")
+    if report.repairs:
+        repairs = Table(title="Verified repairs")
+        repairs.add_column("Choice", justify="right", style="bold cyan")
+        repairs.add_column("Change")
+        repairs.add_column("Type", style="dim")
+        for repair in report.repairs:
+            repairs.add_row(str(repair.rank), repair.description, repair.kind)
+        console.print(repairs)
+        if interactive:
+            console.print(
+                "[dim]Type a repair number to apply it; Truffle will re-echo before solving.[/dim]"
+            )
+        else:
+            console.print(
+                "[dim]Apply one of the verified changes to the YAML spec, then run solve again.[/dim]"
+            )
+    else:
+        console.print("[yellow]No verified repair is available for automatic application.[/yellow]")
 
 
 @app.command()
@@ -253,6 +472,12 @@ def chat(
             outcome = session.confirm_pending(decision)
             if outcome.kind == "solved" and outcome.report and outcome.explanation:
                 _render_solved(outcome.report, outcome.explanation)
+            elif (
+                outcome.kind == "conflict"
+                and outcome.conflict_report
+                and outcome.explanation
+            ):
+                _render_conflict(outcome.explanation, outcome.conflict_report)
             elif outcome.kind == "error":
                 console.print(f"[red]{outcome.text}[/red]\n")
             else:
@@ -260,6 +485,9 @@ def chat(
             continue
         if result.kind == "solved" and result.report and result.explanation:
             _render_solved(result.report, result.explanation)
+            continue
+        if result.kind == "conflict" and result.conflict_report and result.explanation:
+            _render_conflict(result.explanation, result.conflict_report)
             continue
 
 

@@ -61,6 +61,27 @@ def test_verify_rejects_fabricated_number() -> None:
     assert any("1.43" in u or "14.5" in u for u in res.unmatched)
 
 
+def test_verify_handles_leading_dot_and_scientific_notation_as_whole_tokens() -> None:
+    r = _report()
+    accepted = verify(
+        "The objective is .023513, equivalently 2.3513e-2.",
+        r,
+    )
+    assert accepted.ok, accepted.unmatched
+
+    rejected = verify("Fabricated values: .475 and 1e3.", r)
+    assert not rejected.ok
+    assert "0.475" in rejected.unmatched
+    assert "1000" in rejected.unmatched
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\t"])
+def test_verify_rejects_blank_narration(text: str) -> None:
+    result = verify(text, _report())
+    assert not result.ok
+    assert result.unmatched == ["<blank>"]
+
+
 def test_verify_allows_small_integers_for_counts() -> None:
     r = _report()
     text = "Truffle solved a 5-asset problem with 2 binding constraints."

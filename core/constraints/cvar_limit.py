@@ -14,10 +14,10 @@ import cvxpy as cp
 from pydantic import Field
 
 from core.compile_context import BuildContext, build_cvar_block, validate_scenarios
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _new_id
 
 
-class CVaRLimit(_IRModel):
+class CVaRLimit(_ConstraintIRModel):
     """Upper bound on CVaR at confidence ``alpha`` (return-fraction units)."""
 
     kind: Literal["cvar_limit"] = "cvar_limit"
@@ -27,6 +27,11 @@ class CVaRLimit(_IRModel):
         description="Upper bound on CVaR_α, in the same units as scenario returns."
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = True
+
+    @property
+    def slack_scale(self) -> float:
+        return abs(self.max_cvar)
 
 
 def build(node: CVaRLimit, ctx: BuildContext) -> cp.Constraint:

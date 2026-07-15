@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from numbers import Integral
 
 import cvxpy as cp
 import numpy as np
@@ -36,7 +37,7 @@ from core.ir import (
 )
 from core.report import SolutionReport, build_report
 from core.routing import select_solver
-from data.estimation import estimate_moments
+from data.estimation import DEFAULT_PERIODS_PER_YEAR, estimate_moments
 from data.inputs import align_named
 from data.scenarios import historical_scenarios
 
@@ -72,8 +73,7 @@ def human_name_for(c: Constraint) -> str:
 
 @dataclass
 class _ProblemInputs:
-    """The numeric inputs a compile needs, bundled so the continuous restriction
-    can be assembled from index-subselected copies of the originals."""
+    """The numeric inputs shared by the MIP and its continuous restriction."""
 
     mu: np.ndarray
     sigma: np.ndarray
@@ -88,9 +88,7 @@ class _ProblemInputs:
 class _Conditional:
     """Result of the fix-and-resolve continuous restriction."""
 
-    weights: dict[str, float]
     duals: dict[str, float]
-    var: float | None
 
 
 def _scenarios_if_needed(spec: PortfolioSpec, panel: pd.DataFrame) -> np.ndarray | None:
@@ -141,9 +139,8 @@ def _map_status(status: str) -> None:
     if status in {"infeasible", "infeasible_inaccurate"}:
         raise InfeasibleError(
             f"Solver reports the problem is infeasible (status: {status!r}). "
-            "Cardinality combined with position/sector caps can make genuinely "
-            "conflicting requests; a Sprint-5 diagnoser will identify the "
-            "minimal conflicting set."
+            "Use the opt-in diagnosis path to identify a minimal conflicting "
+            "set and any verified repairs."
         )
     if status in {"unbounded", "unbounded_inaccurate"}:
         raise UnboundedError(
@@ -197,78 +194,109 @@ def _selected_indices(compiled: CompiledProblem) -> list[int]:
     return [i for i, v in enumerate(vals) if v > 0.5]
 
 
-def _restrict_spec(
-    spec: PortfolioSpec, selected: list[str], sectors: dict[str, str] | None
-) -> PortfolioSpec:
-    """Build the continuous restriction: universe = selected names, integrality
-    dropped, every other constraint carried over with ids preserved so duals map
-    back to the original IR.
+def _synthetic_constraint_id(base: str, used_ids: set[str]) -> str:
+    """Return a deterministic id that cannot collide with a user constraint."""
 
-    Constraints are adjusted only where the smaller universe demands it: per-
-    ticker Box bounds are intersected with the selection (dropped if empty), and
-    a GroupCap with no selected member is dropped (vacuously satisfied). All ids
-    are preserved so :func:`core.duals.harvest_duals` keys back to the original
-    constraints.
+    candidate = base
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used_ids.add(candidate)
+    return candidate
+
+
+def _conditional_spec(
+    spec: PortfolioSpec, selected_idx: list[int]
+) -> tuple[PortfolioSpec, frozenset[str]]:
+    """Fix the MIP selection while retaining the original full-universe math.
+
+    Dropping assets from the universe is not equivalent to fixing their binary
+    selectors: doing so also drops their entries from ``w_prev``, turnover, and
+    transaction-cost expressions. Instead, keep the complete universe and all
+    non-cardinality nodes, pin every unselected weight to zero, and recreate a
+    Cardinality ``min_position`` floor for selected names. The added Box rows
+    exist only to define the conditional problem and are removed from its dual
+    report.
     """
-    selected_set = set(selected)
-    new_constraints: list = []
-    for c in spec.constraints:
-        if isinstance(c, Cardinality):
-            continue  # drop integrality — the binaries are now fixed
-        if isinstance(c, Box) and c.tickers is not None:
-            kept = [t for t in c.tickers if t in selected_set]
-            if not kept:
-                continue
-            new_constraints.append(c.model_copy(update={"tickers": kept}))
-            continue
-        if isinstance(c, GroupCap):
-            if not any((sectors or {}).get(t) == c.group for t in selected):
-                continue
-            new_constraints.append(c)
-            continue
-        new_constraints.append(c)
-    return PortfolioSpec(
-        universe=list(selected),
-        objective=spec.objective,
-        constraints=new_constraints,
+    selected_idx_set = set(selected_idx)
+    selected = [ticker for i, ticker in enumerate(spec.universe) if i in selected_idx_set]
+    unselected = [ticker for i, ticker in enumerate(spec.universe) if i not in selected_idx_set]
+
+    cardinalities = [c for c in spec.constraints if isinstance(c, Cardinality)]
+    if len(cardinalities) != 1:
+        raise SolverError(
+            "A mixed-integer fix-and-resolve requires exactly one Cardinality constraint."
+        )
+    cardinality = cardinalities[0]
+
+    new_constraints: list[Constraint] = [
+        c for c in spec.constraints if not isinstance(c, Cardinality)
+    ]
+    used_ids = {c.id for c in spec.constraints}
+    synthetic_ids: set[str] = set()
+
+    if unselected:
+        constraint_id = _synthetic_constraint_id("__conditional_unselected_zero", used_ids)
+        synthetic_ids.add(constraint_id)
+        new_constraints.append(
+            Box(
+                id=constraint_id,
+                lower=0.0,
+                upper=0.0,
+                tickers=unselected,
+                elastic=False,
+            )
+        )
+
+    if cardinality.min_position is not None:
+        constraint_id = _synthetic_constraint_id("__conditional_selected_floor", used_ids)
+        synthetic_ids.add(constraint_id)
+        new_constraints.append(
+            Box(
+                id=constraint_id,
+                lower=cardinality.min_position,
+                # LongOnly + Budget(total=1) already imply this upper bound; it
+                # is supplied because Box represents a two-sided interval.
+                upper=1.0,
+                tickers=selected,
+                elastic=False,
+            )
+        )
+
+    return (
+        PortfolioSpec(
+            universe=list(spec.universe),
+            objective=spec.objective,
+            constraints=new_constraints,
+            current_weights=spec.current_weights,
+        ),
+        frozenset(synthetic_ids),
     )
 
 
 def _fix_and_resolve(
     spec: PortfolioSpec, selected_idx: list[int], inputs: _ProblemInputs
 ) -> _Conditional:
-    """Re-solve the continuous problem with the integer selection fixed.
+    """Re-solve the full-universe continuous problem at the fixed selection.
 
-    Fixing the binaries at ``y*`` is equivalent to restricting the universe to
-    the selected names and dropping integrality (the prompt's sanctioned
-    technique). We subselect the *same* mu/sigma/scenarios used by the MIP (not
-    a re-estimate), so the restriction reproduces the MIP's continuous optimum
-    exactly, then harvest its duals — the **conditional** shadow prices.
+    The original MIP remains authoritative for weights, objective value, and
+    VaR. This second solve exists only to recover conditional shadow prices.
+    Keeping the original universe and pre-trade vector makes liquidation,
+    turnover, transaction costs, factor data, and benchmark data identical to
+    the MIP; synthetic rows fix the binary selection without leaking into the
+    reported duals.
     """
     if not selected_idx:
         raise SolverError("The MIP selected no names; cannot form a conditional restriction.")
-    selected = [spec.universe[i] for i in selected_idx]
-    sub = _ProblemInputs(
-        mu=inputs.mu[selected_idx],
-        sigma=inputs.sigma[np.ix_(selected_idx, selected_idx)],
-        scenarios=None if inputs.scenarios is None else inputs.scenarios[:, selected_idx],
-        w_prev=inputs.w_prev[selected_idx],
-        sectors=inputs.sectors,
-        benchmarks=inputs.benchmarks,
-        factors=inputs.factors,
-    )
-    restricted = _restrict_spec(spec, selected, inputs.sectors)
-    compiled = _compile(restricted, sub)
-    choice = select_solver(restricted)  # continuous restriction -> Clarabel
+    restricted, synthetic_ids = _conditional_spec(spec, selected_idx)
+    compiled = _compile(restricted, inputs)
+    choice = select_solver(restricted)  # Cardinality removed -> continuous
     _run_solver(compiled.problem, choice.cp_solver, choice.name)
     _map_status(compiled.problem.status)
-    weights = dict(
-        zip(restricted.universe, [float(x) for x in compiled.recovered_weights()], strict=True)
-    )
+    duals = harvest_duals(compiled)
     return _Conditional(
-        weights=weights,
-        duals=harvest_duals(compiled),
-        var=_var_of(restricted, compiled),
+        duals={cid: value for cid, value in duals.items() if cid not in synthetic_ids}
     )
 
 
@@ -280,6 +308,8 @@ def solve_spec(
     benchmarks: dict[str, dict[str, float]] | None = None,
     factors: dict[str, dict[str, float]] | None = None,
     time_limit_s: float | None = None,
+    diagnose: bool = False,
+    periods_per_year: int = DEFAULT_PERIODS_PER_YEAR,
 ) -> tuple[object, SolutionReport]:
     """Estimate moments, compile, solve, harvest duals, build a SolutionReport.
 
@@ -287,14 +317,15 @@ def solve_spec(
 
     * **Continuous convex** (Clarabel): unchanged from Sprints 1–3. Ordinary,
       *unconditional* duals are harvested directly from the solve.
-    * **Mixed-integer** (HiGHS for MILP / SCIP for MIQP): an integer program has
+    * **Mixed-integer** (HiGHS for MILP / SCIP for MIQP or MISOCP): an integer program has
       no meaningful dual variables, so after the MIP solve we run a
       *fix-and-resolve* (:func:`_fix_and_resolve`) — fix the binaries at the
-      optimal selection ``y*`` (equivalently, restrict the universe to the
-      selected names and drop integrality), re-solve the resulting continuous
-      problem with Clarabel, and harvest its duals. Those are **conditional**
-      shadow prices: valid given the selected name set, not globally. The report
-      is flagged ``duals_conditional=True`` and carries ``selected_names``.
+      optimal selection ``y*`` with full-universe zero/floor rows, drop the
+      Cardinality node, re-solve the resulting continuous problem with
+      Clarabel, and harvest its duals. Those are **conditional** shadow prices:
+      valid given the selected name set, not globally. The original MIP remains
+      authoritative for final weights and VaR. The report is flagged
+      ``duals_conditional=True`` and carries ``selected_names``.
 
     Args:
         spec: validated ``PortfolioSpec`` whose ``universe`` is a subset of
@@ -308,6 +339,12 @@ def solve_spec(
         time_limit_s: optional wall-clock limit passed to the MIP solver
             (ignored on the continuous path). Wired by the chat loop's
             universe-size guard (Slice 4).
+        diagnose: when true, an infeasible solve runs the opt-in elastic/IIS
+            pass and attaches its ``ConflictReport`` to ``InfeasibleError``.
+            The default remains false because diagnosis requires several
+            additional solves and callers must choose that cost explicitly.
+        periods_per_year: annualization factor used for estimated means and
+            covariance (252 for daily closes, 52 for weekly, 12 for monthly).
 
     Returns:
         ``(compiled, report)`` — the compiled problem (for callers that want
@@ -322,7 +359,14 @@ def solve_spec(
         missing = sorted(set(spec.universe) - set(prices.columns))
         raise SolverError(f"Prices CSV is missing universe tickers: {missing}.")
     panel = prices[spec.universe]
-    mu, sigma = estimate_moments(panel)
+    if (
+        isinstance(periods_per_year, bool)
+        or not isinstance(periods_per_year, Integral)
+        or periods_per_year < 1
+    ):
+        raise SolverError("periods_per_year must be a positive integer.")
+    annualization = int(periods_per_year)
+    mu, sigma = estimate_moments(panel, periods_per_year=annualization)
     scenarios = _scenarios_if_needed(spec, panel)
     # Single-shot pre-trade vector; absent holdings default to 0.0 ("from cash").
     w_prev = np.asarray(spec.w_prev_vector(), dtype=float)
@@ -339,11 +383,40 @@ def solve_spec(
     choice = select_solver(spec)
     compiled = _compile(spec, inputs)
 
+    def _check_status() -> None:
+        try:
+            _map_status(compiled.problem.status)
+        except InfeasibleError as exc:
+            if diagnose:
+                # Lazy import keeps the ordinary solve path independent of the
+                # multi-solve diagnostic machinery and avoids a module cycle.
+                from core.diagnose import diagnose_infeasibility  # noqa: PLC0415
+
+                try:
+                    exc.conflict_report = diagnose_infeasibility(
+                        spec,
+                        prices,
+                        sectors=sectors,
+                        benchmarks=benchmarks,
+                        factors=factors,
+                        periods_per_year=annualization,
+                    )
+                except Exception as diagnosis_error:
+                    # Diagnosis is an optional, secondary multi-solve pass.  A
+                    # missing backend or diagnostic bug must never replace the
+                    # solver's primary and already-proven infeasibility result.
+                    exc.add_note(
+                        "Optional infeasibility diagnosis failed: "
+                        f"{type(diagnosis_error).__name__}."
+                    )
+                    raise exc from diagnosis_error
+            raise
+
     if not choice.is_mip:
         # Continuous convex path (Clarabel) — unchanged from Sprints 1–3, with
         # ordinary (unconditional) duals harvested directly from the solve.
         elapsed_ms = _run_solver(compiled.problem, choice.cp_solver, choice.name)
-        _map_status(compiled.problem.status)
+        _check_status()
         weights = dict(
             zip(spec.universe, [float(x) for x in compiled.recovered_weights()], strict=True)
         )
@@ -366,7 +439,7 @@ def solve_spec(
     elapsed_ms = _run_solver(
         compiled.problem, choice.cp_solver, choice.name, time_limit_s=time_limit_s
     )
-    _map_status(compiled.problem.status)
+    _check_status()
     gap = _optimality_gap(compiled.problem)
 
     selected_idx = _selected_indices(compiled)
@@ -374,10 +447,12 @@ def solve_spec(
 
     cond = _fix_and_resolve(spec, selected_idx, inputs)
 
-    # Full-universe weights: unselected names are exactly 0; selected names take
-    # the continuous-restriction weights (which reproduce the MIP optimum).
-    weights = {t: 0.0 for t in spec.universe}
-    weights.update(cond.weights)
+    # The MIP is the sole source of the portfolio and objective auxiliaries.
+    # Fix-and-resolve exists only for conditional duals; using its weights would
+    # make a numerically different continuous solution the reported decision.
+    weights = dict(
+        zip(spec.universe, [float(x) for x in compiled.recovered_weights()], strict=True)
+    )
     report = build_report(
         weights=weights,
         objective_kind=spec.objective.kind,
@@ -387,7 +462,7 @@ def solve_spec(
         status=compiled.problem.status,
         duals=cond.duals,
         constraint_human_names=_human_names(spec),
-        var=cond.var,
+        var=_var_of(spec, compiled),
         duals_conditional=True,
         selected_names=selected,
         optimality_gap=gap,

@@ -79,9 +79,7 @@ def validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> N
     """Shape/symmetry checks shared by every compile path."""
     n = len(spec.universe)
     if sigma.shape != (n, n):
-        raise CompilationError(
-            f"Covariance shape {sigma.shape} does not match universe size {n}."
-        )
+        raise CompilationError(f"Covariance shape {sigma.shape} does not match universe size {n}.")
     if mu.shape != (n,):
         raise CompilationError(
             f"Expected-return vector shape {mu.shape} does not match universe size ({n},)."
@@ -90,9 +88,7 @@ def validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> N
     # off-by-eps asymmetry from floating point is a common compile-time surprise.
     asym = float(np.max(np.abs(sigma - sigma.T))) if sigma.size else 0.0
     if asym > 1e-8:
-        raise CompilationError(
-            f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e})."
-        )
+        raise CompilationError(f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e}).")
 
 
 def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:
@@ -126,9 +122,7 @@ def validate_scenarios(scenarios: np.ndarray | None, n: int) -> np.ndarray:
         )
     scenarios = np.asarray(scenarios, dtype=float)
     if scenarios.ndim != 2 or scenarios.shape[1] != n:
-        raise CompilationError(
-            f"Scenario matrix must have shape (S, {n}); got {scenarios.shape}."
-        )
+        raise CompilationError(f"Scenario matrix must have shape (S, {n}); got {scenarios.shape}.")
     if scenarios.shape[0] < 1:
         raise CompilationError("Scenario matrix must have at least one scenario row.")
     return scenarios
@@ -207,6 +201,10 @@ class BuildContext:
     # Per-asset weight upper bounds (from Box nodes), used as the cardinality
     # big-M. ``None`` means "no tighter cap than 1.0 per name".
     weight_upper: np.ndarray | None = None
+    # Per-asset lower bounds for the Cardinality selection link. Production
+    # long-only specs use zero; diagnostic counterfactuals may supply rigorously
+    # derived signed bounds after deleting a domain constraint.
+    weight_lower: np.ndarray | None = None
 
     penalties: list[cp.Expression] = field(default_factory=list)
     aux_constraints: list[cp.Constraint] = field(default_factory=list)

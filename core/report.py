@@ -27,8 +27,123 @@ floating-point noise.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from core.patch import SpecPatch
 
 BINDING_THRESHOLD = 1e-6
+
+
+class _DiagnosticModel(BaseModel):
+    """Frozen, JSON-serializable base for infeasibility reports."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class GroundValue(_DiagnosticModel):
+    """One trusted numeric fact available to conflict narration."""
+
+    key: str
+    value: float
+    unit: Literal["raw", "fraction", "bps", "count", "milliseconds"] = "raw"
+    source: Literal["solver", "spec", "derived"] = "solver"
+
+
+class ConflictEvidence(_DiagnosticModel):
+    """Deterministic explanation fragment and the values that support it."""
+
+    text: str
+    values: tuple[GroundValue, ...] = ()
+
+
+class ConstraintSlack(_DiagnosticModel):
+    """Normalized elastic violation for one IR constraint."""
+
+    constraint_id: str
+    human_name: str
+    raw_slack: float
+    slack_scale: float
+    relative_slack: float
+
+
+class ElasticResult(_DiagnosticModel):
+    """Result of the normalized elastic feasibility pass."""
+
+    kind: Literal["soft_repair", "hard_infeasible"]
+    status: str
+    solver: str
+    solve_time_ms: float
+    total_relative_slack: float | None = None
+    slacks: tuple[ConstraintSlack, ...] = ()
+    candidate_constraint_ids: tuple[str, ...] = ()
+    repaired_weights: dict[str, float] | None = None
+
+
+class IISResult(_DiagnosticModel):
+    """A node-level irreducible infeasible subsystem search result."""
+
+    constraint_ids: tuple[str, ...]
+    verified: bool
+    checks: int
+    fallback_reason: str | None = None
+
+
+class ConflictMember(_DiagnosticModel):
+    """One constraint named in a verified or candidate conflict set."""
+
+    constraint_id: str
+    constraint_kind: str
+    human_name: str
+    relaxability: Literal["relaxable", "structural", "user_locked"]
+    required_slack: float | None = None
+    slack_scale: float | None = None
+    relative_slack: float | None = None
+    parameters: tuple[GroundValue, ...] = ()
+
+
+class RepairChange(_DiagnosticModel):
+    """One solver-derived field change applied by a repair patch."""
+
+    constraint_id: str
+    field: str
+    direction: Literal["raise", "lower"]
+    old_value: float
+    solver_required_value: float
+    applied_value: float
+    required_change: float
+    normalized_change: float
+    unit: Literal["raw", "fraction", "bps", "count"]
+
+
+class Repair(_DiagnosticModel):
+    """A deterministic, verified amendment that restores feasibility."""
+
+    repair_id: str
+    description: str
+    patch: SpecPatch
+    changes: tuple[RepairChange, ...]
+    required_change: float | None = None
+    relative_change: float
+    kind: Literal["single_lever", "joint"]
+    rank: int = Field(ge=1)
+    verified: Literal[True] = True
+
+
+class ConflictReport(_DiagnosticModel):
+    """The only numeric surface the infeasibility explainer may read."""
+
+    kind: Literal["conflict_report"] = "conflict_report"
+    solver_status: str
+    n_assets: int = Field(ge=1)
+    minimality_status: Literal["verified_iis", "unverified_candidate"]
+    conflict_scope: Literal["soft_only", "mixed", "hard_only"]
+    candidate_constraint_ids: tuple[str, ...]
+    conflict_set: tuple[ConflictMember, ...]
+    elastic: ElasticResult
+    evidence: tuple[ConflictEvidence, ...] = ()
+    repairs: tuple[Repair, ...] = ()
 
 
 @dataclass(frozen=True)

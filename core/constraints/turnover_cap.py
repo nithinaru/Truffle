@@ -14,10 +14,10 @@ import cvxpy as cp
 from pydantic import Field
 
 from core.compile_context import BuildContext, abs_deviation
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _new_id
 
 
-class TurnoverCap(_IRModel):
+class TurnoverCap(_ConstraintIRModel):
     """Hard cap on total turnover relative to the pre-trade weights."""
 
     kind: Literal["turnover_cap"] = "turnover_cap"
@@ -26,6 +26,12 @@ class TurnoverCap(_IRModel):
         gt=0.0, description="Upper bound on ‖w − w_prev‖₁ (sum of absolute weight changes)."
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = True
+    big_m: ClassVar[float | None] = 2.0
+
+    @property
+    def slack_scale(self) -> float:
+        return self.max_turnover
 
 
 def build(node: TurnoverCap, ctx: BuildContext) -> cp.Constraint:

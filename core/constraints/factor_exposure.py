@@ -13,10 +13,10 @@ import cvxpy as cp
 from pydantic import Field, model_validator
 
 from core.compile_context import BuildContext
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _new_id
 
 
-class FactorExposure(_IRModel):
+class FactorExposure(_ConstraintIRModel):
     """Bound ``loadingsᵀ w`` for one factor; supply min, max, or both."""
 
     kind: Literal["factor_exposure"] = "factor_exposure"
@@ -25,6 +25,16 @@ class FactorExposure(_IRModel):
     min_exposure: float | None = Field(default=None, description="Lower bound on loadingsᵀw.")
     max_exposure: float | None = Field(default=None, description="Upper bound on loadingsᵀw.")
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = True
+
+    @property
+    def slack_scale(self) -> float:
+        """Bound width, or the magnitude of the sole one-sided bound."""
+        if self.min_exposure is not None and self.max_exposure is not None:
+            return self.max_exposure - self.min_exposure
+        bound = self.max_exposure if self.max_exposure is not None else self.min_exposure
+        assert bound is not None  # guaranteed by _check_bounds
+        return abs(bound)
 
     @model_validator(mode="after")
     def _check_bounds(self) -> FactorExposure:

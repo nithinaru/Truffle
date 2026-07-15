@@ -16,10 +16,10 @@ import cvxpy as cp
 from pydantic import Field
 
 from core.compile_context import BuildContext, abs_deviation
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _new_id
 
 
-class TransactionCost(_IRModel):
+class TransactionCost(_ConstraintIRModel):
     """Proportional cost in basis points applied to ``‖w − w_prev‖₁``."""
 
     kind: Literal["transaction_cost"] = "transaction_cost"
@@ -28,6 +28,7 @@ class TransactionCost(_IRModel):
         ge=0.0, description="Proportional cost in basis points (1 bp = 0.01%) per unit traded."
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = False
 
 
 def build(node: TransactionCost, ctx: BuildContext) -> None:

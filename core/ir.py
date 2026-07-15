@@ -34,7 +34,7 @@ from core.constraints.turnover_cap import TurnoverCap
 # Base IR model + helpers live in the dependency-light core.irbase leaf module so
 # the per-node constraint/objective modules above can subclass _IRModel without
 # cycling back through this module.
-from core.irbase import ProblemClassImpact, _IRModel, _new_id
+from core.irbase import ProblemClassImpact, _ConstraintIRModel, _IRModel, _new_id
 from core.objectives.max_sharpe import MaxSharpe
 from core.objectives.min_tracking_error import MinTrackingError
 from core.objectives.risk_parity import RiskParity
@@ -128,24 +128,26 @@ Objective = Annotated[
 # ---------------------------------------------------------------------------
 
 
-class Budget(_IRModel):
+class Budget(_ConstraintIRModel):
     """Sum-of-weights constraint: ``Σ w_i = total`` (default fully invested)."""
 
     kind: Literal["budget"] = "budget"
     id: str = Field(default_factory=lambda: _new_id("budget"))
     total: float = Field(default=1.0, description="Right-hand side of Σw = total.")
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = False
 
 
-class LongOnly(_IRModel):
+class LongOnly(_ConstraintIRModel):
     """Long-only: ``w_i ≥ 0`` for every asset."""
 
     kind: Literal["long_only"] = "long_only"
     id: str = Field(default_factory=lambda: _new_id("longonly"))
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = False
 
 
-class Box(_IRModel):
+class Box(_ConstraintIRModel):
     """Per-asset bounds: ``lower ≤ w_i ≤ upper``.
 
     If ``tickers`` is ``None`` the bound applies to every asset. If provided,
@@ -162,6 +164,13 @@ class Box(_IRModel):
         description="If set, restrict this bound to the listed tickers; else applies universe-wide.",
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
+    elastic_default: ClassVar[bool] = True
+    big_m: ClassVar[float | None] = 1.0
+
+    @property
+    def slack_scale(self) -> float:
+        """Natural weight unit: the largest absolute bound magnitude."""
+        return max(abs(self.lower), abs(self.upper))
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Box:
@@ -193,9 +202,8 @@ Constraint = Annotated[
 class PortfolioSpec(_IRModel):
     """Top-level description of a portfolio optimization problem.
 
-    The IR is intentionally narrow in Sprint 1: only constraints/objectives
-    that exercise the compiler-and-duals plumbing end to end. Later sprints
-    add CVaR, cardinality, group caps, etc.
+    The IR stays intentionally bounded to objective and constraint nodes whose
+    compiler, validation, reporting, and diagnosis behavior is deterministic.
     """
 
     universe: list[str] = Field(min_length=1, description="Asset tickers; order is canonical.")
@@ -208,8 +216,8 @@ class PortfolioSpec(_IRModel):
             "transaction-cost terms. Convention: any universe ticker absent "
             "from this mapping is treated as weight 0.0; None means the whole "
             "vector is 0.0, i.e. the portfolio is being built fresh from cash "
-            "(full deployment). This is the single-shot input; per-rebalance "
-            "threading is a later sprint."
+            "(full deployment). The walk-forward engine refreshes this mapping "
+            "with drifted pre-trade holdings at every scheduled solve."
         ),
     )
 

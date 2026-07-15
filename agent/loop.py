@@ -30,6 +30,7 @@ from typing import Literal
 import pandas as pd
 
 from agent.client import LLMClient
+from agent.diagnose import explain_conflict, template_conflict_summary
 from agent.explain import explain, template_summary
 from agent.parse import parse_user_message
 from agent.render import render_patch, render_spec
@@ -47,7 +48,7 @@ from core.exceptions import (
     UnboundedError,
 )
 from core.ir import PortfolioSpec
-from core.report import SolutionReport
+from core.report import ConflictReport, SolutionReport
 from core.solve import solve_spec
 
 RESET_PHRASES = frozenset({"start over", "new portfolio", "reset", "/reset"})
@@ -92,13 +93,22 @@ class _Pending:
 
 
 @dataclass
+class _ConflictState:
+    """The server-owned diagnosis whose verified repairs may be selected."""
+
+    spec: PortfolioSpec
+    report: ConflictReport
+
+
+@dataclass
 class TurnResult:
     """Typed return value of one chat turn — drives terminal rendering."""
 
-    kind: Literal["clarification", "echo", "solved", "error", "info", "noop"]
+    kind: Literal["clarification", "echo", "solved", "conflict", "error", "info", "noop"]
     text: str
     pending_spec: PortfolioSpec | None = None
     report: SolutionReport | None = None
+    conflict_report: ConflictReport | None = None
     explanation: str | None = None
     extra: dict[str, str] = field(default_factory=dict)
 
@@ -127,6 +137,7 @@ class ChatSession:
         self._factors = factors
         self.current_spec: PortfolioSpec | None = None
         self.pending: _Pending | None = None
+        self.conflict: _ConflictState | None = None
 
     @property
     def universe_metadata(self) -> dict[str, object]:
@@ -138,6 +149,7 @@ class ChatSession:
     def reset(self) -> None:
         self.current_spec = None
         self.pending = None
+        self.conflict = None
 
     def handle_user_message(self, text: str) -> TurnResult:
         """Process one user message; return a TurnResult for rendering."""
@@ -145,6 +157,14 @@ class ChatSession:
         if normalized in RESET_PHRASES:
             self.reset()
             return TurnResult(kind="info", text="Session reset. Tell me about the new portfolio.")
+        if self.conflict is not None:
+            selectors = {
+                selector
+                for repair in self.conflict.report.repairs
+                for selector in (repair.repair_id, str(repair.rank))
+            }
+            if text.strip() in selectors:
+                return self.select_repair(text.strip())
 
         try:
             parse = parse_user_message(
@@ -160,6 +180,7 @@ class ChatSession:
             return TurnResult(kind="clarification", text=parse.question)
         if isinstance(parse, FreshSpec):
             spec = parse.spec
+            self.conflict = None
             echo = render_spec(spec)
             time_limit, guard_warn = _mip_guard(spec)
             if guard_warn:
@@ -179,6 +200,7 @@ class ChatSession:
             except ValueError as e:
                 return TurnResult(kind="error", text=f"The patch would produce an invalid spec.\n{e}")
             diff = render_patch(parse, self.current_spec, new_spec)
+            self.conflict = None
             time_limit, guard_warn = _mip_guard(new_spec)
             if guard_warn:
                 diff = f"{diff}\n\n{guard_warn}"
@@ -228,9 +250,29 @@ class ChatSession:
                 benchmarks=self._benchmarks,
                 factors=self._factors,
                 time_limit_s=pending.time_limit_s,
+                diagnose=True,
             )
         except InfeasibleError as e:
-            return TurnResult(kind="error", text=str(e))
+            if not isinstance(e.conflict_report, ConflictReport):
+                # Do not leave an older repair menu live if the optional
+                # diagnosis pass failed for this newly confirmed spec.
+                self.conflict = None
+                return TurnResult(kind="error", text=str(e))
+            conflict_report = e.conflict_report
+            self.conflict = _ConflictState(spec=pending.spec, report=conflict_report)
+            try:
+                explanation, _ = explain_conflict(conflict_report, client=self._client)
+            except Exception:
+                # Narration is optional presentation over a deterministic
+                # report.  Grounding failures and text-provider failures both
+                # fall back locally; neither may crash or alter repair data.
+                explanation = template_conflict_summary(conflict_report)
+            return TurnResult(
+                kind="conflict",
+                text="The confirmed constraints are infeasible.",
+                conflict_report=conflict_report,
+                explanation=explanation,
+            )
         except UnboundedError as e:
             return TurnResult(kind="error", text=str(e))
         except SolverError as e:
@@ -240,9 +282,57 @@ class ChatSession:
             explanation, _ = explain(report, client=self._client)
         except GroundingFailedError:
             explanation = template_summary(report)
+        self.conflict = None
         return TurnResult(
             kind="solved",
             text="Solved.",
             report=report,
             explanation=explanation,
         )
+
+    def select_repair(self, selection: str | int) -> TurnResult:
+        """Apply a server-owned verified repair and return a new spec echo.
+
+        Selection never auto-solves.  The repaired spec must pass the same
+        deterministic echo and explicit confirmation gate as every other
+        amendment.
+        """
+
+        if self.conflict is None:
+            return TurnResult(kind="info", text="There is no conflict repair to select.")
+        token = str(selection).strip()
+        repair = next(
+            (
+                candidate
+                for candidate in self.conflict.report.repairs
+                if token in {candidate.repair_id, str(candidate.rank)}
+            ),
+            None,
+        )
+        if repair is None:
+            return TurnResult(
+                kind="info",
+                text="Choose one of the listed repair numbers; no change was applied.",
+                conflict_report=self.conflict.report,
+            )
+        prior = self.conflict.spec
+        try:
+            repaired = apply_patch(prior, repair.patch)
+        except ValueError as exc:
+            return TurnResult(kind="error", text=f"The verified repair no longer applies.\n{exc}")
+        echo = (
+            render_patch(repair.patch, prior, repaired)
+            + "\n\n"
+            + render_spec(repaired)
+        )
+        time_limit, guard_warn = _mip_guard(repaired)
+        if guard_warn:
+            echo = f"{echo}\n\n{guard_warn}"
+        self.pending = _Pending(
+            spec=repaired,
+            echo=echo,
+            from_patch=repair.patch,
+            prior_spec=prior,
+            time_limit_s=time_limit,
+        )
+        return TurnResult(kind="echo", text=echo, pending_spec=repaired)

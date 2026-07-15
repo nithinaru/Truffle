@@ -23,6 +23,8 @@ Annualization:
 
 from __future__ import annotations
 
+from numbers import Integral
+
 import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
@@ -53,6 +55,13 @@ def estimate_moments(
         ValueError: if the price panel has fewer than 2 rows (no returns)
             or contains non-positive prices (log undefined).
     """
+    if (
+        isinstance(periods_per_year, bool)
+        or not isinstance(periods_per_year, Integral)
+        or periods_per_year < 1
+    ):
+        raise ValueError("periods_per_year must be a positive integer.")
+    annualization = int(periods_per_year)
     if prices.shape[0] < 2:
         raise ValueError(
             f"Need at least 2 price observations to compute returns; got {prices.shape[0]}."
@@ -63,12 +72,12 @@ def estimate_moments(
     log_prices = np.log(prices.to_numpy(dtype=float))
     log_returns = np.diff(log_prices, axis=0)  # shape (T-1, N)
 
-    mu = log_returns.mean(axis=0) * periods_per_year
+    mu = log_returns.mean(axis=0) * annualization
 
     # Ledoit–Wolf shrinks toward a (μ_trace · I) target. Always PSD by
     # construction, which is what the compiler's `cp.psd_wrap` is promising.
     lw = LedoitWolf().fit(log_returns)
-    sigma = lw.covariance_ * periods_per_year
+    sigma = lw.covariance_ * annualization
 
     # Defensive symmetrization — Ledoit–Wolf returns symmetric matrices in
     # principle, but downstream `cp.quad_form` is allergic to even 1e-15

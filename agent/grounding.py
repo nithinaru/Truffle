@@ -32,19 +32,31 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from core.report import SolutionReport
+from core.report import ConflictReport, GroundValue, SolutionReport
 
-# Numeric token: optional sign, digits with optional thousands commas and
-# optional decimal, optional %/bps suffix. Trailing $ prefix is also caught.
+# Numeric token: optional sign/currency prefix, a conventional or leading-dot
+# decimal (with optional thousands separators), optional scientific notation,
+# and an optional %/bps suffix.  The boundaries are intentionally strict: a
+# malformed token such as ``1,2`` must not be accepted as two independently
+# grounded numbers, and ``.25`` must not silently become ``25``.
 _NUM_RE = re.compile(
     r"""
+    (?<![\w.,])
     (?P<lead>[-+]?)
-    (?:\$\s*)?                       # $ prefix
-    (?P<int>\d{1,3}(?:,\d{3})+|\d+)  # integer (with optional thousands commas)
-    (?:\.(?P<frac>\d+))?             # optional fractional part
-    (?:\s*(?P<suffix>%|bps))?        # optional suffix
+    (?:\$\s*)?
+    (?P<number>
+        (?:
+            \d{1,3}(?:,\d{3})+(?:\.\d*)?  # thousands separators
+            | \d+(?:\.\d*)?                 # integer / conventional decimal
+            | \.\d+                          # leading-dot decimal
+        )
+        (?:[eE][-+]?\d+)?                    # scientific notation
+    )
+    (?:\s*(?P<suffix>%|bps))?
+    (?!\w)
+    (?!,\d)
     """,
-    re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 SMALL_INT_ALLOWLIST: set[int] = set(range(0, 13))
@@ -68,14 +80,14 @@ def _extract_numerals(text: str) -> list[tuple[float, str | None]]:
     """
     out: list[tuple[float, str | None]] = []
     for m in _NUM_RE.finditer(text):
-        int_part = m.group("int").replace(",", "")
-        frac = m.group("frac")
-        raw = f"{m.group('lead') or ''}{int_part}" + (f".{frac}" if frac else "")
+        number = m.group("number").replace(",", "")
+        raw = f"{m.group('lead') or ''}{number}"
         try:
             value = float(raw)
         except ValueError:
             continue
-        out.append((value, m.group("suffix")))
+        suffix = m.group("suffix")
+        out.append((value, suffix.lower() if suffix is not None else None))
     return out
 
 
@@ -90,6 +102,26 @@ def _candidate_values(report: SolutionReport) -> list[float]:
     for b in report.binding:
         vals.append(b.shadow_price)
     return vals
+
+
+def _conflict_values(report: ConflictReport) -> list[GroundValue]:
+    """Typed values exposed to free-form infeasibility narration.
+
+    Repair targets and elastic-solver internals are deliberately absent.  The
+    model receives the same narrow surface in :mod:`agent.diagnose`; verified
+    repairs are rendered separately from server-owned ``Repair`` objects.
+    """
+
+    values: list[GroundValue] = [
+        GroundValue(
+            key="n_assets", value=float(report.n_assets), unit="count", source="spec"
+        )
+    ]
+    for evidence in report.evidence:
+        values.extend(evidence.values)
+    for member in report.conflict_set:
+        values.extend(member.parameters)
+    return values
 
 
 def _renderings(value: float) -> set[str]:
@@ -124,21 +156,79 @@ def _matches_any(
     """Is ``numeral`` (with optional %/bps suffix) within tolerance of any
     raw/percent/bps rendering of any report value?
     """
-    scaled_candidates: list[float] = []
-    for v in report_values:
-        scaled_candidates.extend([v, v * 100.0, v * 10000.0])
-
     # The suffix narrows what the numeral encodes:
     #   "%"   means the writer meant value/100; compare against (raw * 100).
     #   "bps" means the writer meant value/10000; compare against (raw * 10000).
-    # Either way the raw token is `numeral`; we just compare to scaled values.
+    # An unsuffixed number keeps the legacy raw/percent/bps rendering support.
+    scaled_candidates: list[float] = []
+    for v in report_values:
+        if suffix == "%":
+            scaled_candidates.append(v * 100.0)
+        elif suffix == "bps":
+            scaled_candidates.append(v * 10000.0)
+        else:
+            scaled_candidates.extend([v, v * 100.0, v * 10000.0])
+
     for sv in scaled_candidates:
         if abs(sv - numeral) <= max(tol_abs, tol_rel * max(abs(sv), abs(numeral))):
             return True
     return suffix is None and abs(numeral) <= 12 and numeral == int(numeral)
 
 
-def verify(explanation: str, report: SolutionReport) -> GroundingResult:
+def _matches_ground_value(
+    numeral: float,
+    suffix: str | None,
+    candidate: GroundValue,
+    *,
+    tol_rel: float = 5e-3,
+    tol_abs: float = 5e-4,
+) -> bool:
+    """Unit-aware match for a conflict-report value.
+
+    Unlike legacy solution grounding, a count cannot authorize a percentage
+    and a fraction cannot authorize an arbitrary raw/bps rendering.  This is
+    important for repair targets: ``34 names`` and ``34%`` are different facts.
+    """
+
+    expected: float
+    if candidate.unit == "fraction":
+        if suffix == "%":
+            expected = candidate.value * 100.0
+        elif suffix == "bps":
+            expected = candidate.value * 10000.0
+        else:
+            expected = candidate.value
+    elif candidate.unit == "bps":
+        if suffix not in {None, "bps"}:
+            return False
+        expected = candidate.value
+    elif candidate.unit == "count":
+        if suffix is not None or numeral != int(numeral):
+            return False
+        expected = candidate.value
+    else:  # raw / milliseconds
+        if suffix is not None:
+            return False
+        expected = candidate.value
+    return abs(expected - numeral) <= max(
+        tol_abs, tol_rel * max(abs(expected), abs(numeral))
+    )
+
+
+def _verify_conflict(explanation: str, report: ConflictReport) -> GroundingResult:
+    numerals = _extract_numerals(explanation)
+    if not numerals:
+        return GroundingResult(ok=True)
+    candidates = _conflict_values(report)
+    unmatched: list[str] = []
+    for value, suffix in numerals:
+        if any(_matches_ground_value(value, suffix, candidate) for candidate in candidates):
+            continue
+        unmatched.append(f"{value:g}{suffix or ''}")
+    return GroundingResult(ok=not unmatched, unmatched=unmatched)
+
+
+def verify(explanation: str, report: SolutionReport | ConflictReport) -> GroundingResult:
     """Check every numeral in ``explanation`` against ``report``.
 
     Returns:
@@ -147,6 +237,12 @@ def verify(explanation: str, report: SolutionReport) -> GroundingResult:
         with ``unmatched`` populated; the chat loop uses that list to ask
         the model to regenerate.
     """
+    if not explanation.strip():
+        return GroundingResult(ok=False, unmatched=["<blank>"])
+
+    if isinstance(report, ConflictReport):
+        return _verify_conflict(explanation, report)
+
     numerals = _extract_numerals(explanation)
     if not numerals:
         return GroundingResult(ok=True)
