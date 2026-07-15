@@ -140,8 +140,9 @@ def _mip_advisory(spec: PortfolioSpec) -> list[str]:
         f"    {cause_line}",
         "  • It is solved by a mixed-integer solver (HiGHS for MILP, SCIP for",
         "    MIQP/MISOCP), which can take noticeably longer than a convex solve.",
-        "  • Shadow prices will be CONDITIONAL on the selected names (computed by",
-        "    fixing the chosen names and re-solving), not global sensitivities.",
+        "  • Sensitivities, when available, are CONDITIONAL on the selected names",
+        "    (computed by fixing the selection and re-solving), not global.",
+        "    Time-limited or mismatched conditional portfolios report them unavailable.",
     ]
 
 

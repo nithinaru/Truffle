@@ -59,7 +59,7 @@ def _load_prices(prices_path: Path, universe: list[str]) -> pd.DataFrame:
 
 
 def _render_weights(spec: PortfolioSpec, weights: list[float]) -> Table:
-    t = Table(title="Optimal weights", show_lines=False)
+    t = Table(title="Portfolio weights", show_lines=False)
     t.add_column("Ticker", style="bold cyan")
     t.add_column("Weight", justify="right")
     t.add_column("Weight %", justify="right")
@@ -69,12 +69,153 @@ def _render_weights(spec: PortfolioSpec, weights: list[float]) -> Table:
 
 
 def _render_binding(report: SolutionReport) -> Table:
-    t = Table(title="Binding constraints (shadow prices, largest first)")
+    title = (
+        "Material active sensitivities (conditional on selected names)"
+        if report.duals_conditional
+        else "Material active constraint sensitivities"
+    )
+    t = Table(title=title)
     t.add_column("Constraint", style="bold magenta")
-    t.add_column("Shadow price", justify="right")
-    for b in report.binding:
-        t.add_row(b.human_name, f"{b.shadow_price:.6f}")
+    t.add_column("Row")
+    t.add_column("Side")
+    t.add_column("Bound", justify="right")
+    t.add_column("Primal", justify="right")
+    t.add_column("Slack", justify="right")
+    t.add_column("Signed derivative", justify="right")
+    t.add_column("Scale", justify="right")
+    t.add_column("Unit")
+    names = {
+        (item.constraint_id, item.row_label, item.side): item.human_name
+        for item in report.binding
+    }
+    active = [
+        item
+        for item in report.sensitivities
+        if (item.constraint_id, item.row_label, item.side) in names
+    ]
+    if active:
+        for item in active:
+            t.add_row(
+                names[(item.constraint_id, item.row_label, item.side)],
+                item.row_label,
+                item.side,
+                f"{item.bound_value:.6f} {item.bound_unit}",
+                f"{item.primal_value:.6f}",
+                f"{item.slack:.6f}",
+                f"{item.objective_derivative_per_bound_unit:+.6f}",
+                f"{item.parameter_scale:.6f}",
+                f"{item.objective_unit}_per_{item.bound_unit}",
+            )
+    else:
+        for item in report.binding:
+            t.add_row(
+                item.human_name,
+                item.row_label or "legacy aggregate",
+                item.side or "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                f"{item.shadow_price:.6f}",
+                "n/a",
+                item.sensitivity_unit or "legacy solver units",
+            )
     return t
+
+
+def _render_sensitivity_coverage(report: SolutionReport) -> Table | None:
+    unavailable = [
+        (constraint_id, item)
+        for constraint_id, item in report.sensitivity_coverage.items()
+        if item.availability == "unavailable"
+    ]
+    if not unavailable:
+        return None
+    table = Table(title="Unavailable sensitivity coverage")
+    table.add_column("Constraint / implicit row", style="bold yellow")
+    table.add_column("Reason")
+    for constraint_id, item in unavailable:
+        table.add_row(constraint_id, item.reason or "No validated sensitivity record.")
+    return table
+
+
+def _render_objective(report: SolutionReport) -> Table | None:
+    decomposition = report.objective_decomposition
+    if decomposition is None:
+        return None
+    table = Table(title="Objective decomposition")
+    table.add_column("Term", style="bold cyan")
+    table.add_column("Role")
+    table.add_column("Natural value", justify="right")
+    table.add_column("Natural unit")
+    table.add_column("Coefficient", justify="right")
+    table.add_column("Score contribution", justify="right")
+    for term in decomposition.terms:
+        table.add_row(
+            term.label,
+            term.role,
+            f"{term.natural_value:.6f}",
+            term.natural_unit,
+            f"{term.coefficient:.6f}",
+            f"{term.objective_contribution:.6f} objective_score",
+        )
+    table.add_section()
+    table.add_row(
+        "Solver total",
+        decomposition.sense,
+        "",
+        "",
+        "",
+        f"{decomposition.solver_value:.6f} {decomposition.solver_unit}",
+    )
+    table.add_row(
+        "Reconstruction residual",
+        "validation",
+        "",
+        "",
+        "",
+        f"{decomposition.reconstruction_error:.6f} "
+        f"{decomposition.reconstruction_error_unit}",
+    )
+    return table
+
+
+def _render_metrics(report: SolutionReport) -> Table | None:
+    if not report.metrics:
+        return None
+    table = Table(title="Portfolio metrics")
+    table.add_column("Metric", style="bold green")
+    table.add_column("Value", justify="right")
+    table.add_column("Unit")
+    table.add_column("Context")
+    for metric in report.metrics:
+        context: list[str] = []
+        if metric.annualization_periods is not None:
+            context.append(f"{metric.annualization_periods} periods/year")
+        if metric.confidence_level is not None:
+            context.append(f"confidence {metric.confidence_level:.6f}")
+        if metric.benchmark is not None:
+            context.append(f"benchmark {metric.benchmark}")
+        table.add_row(
+            metric.label,
+            f"{metric.value:.6f}",
+            metric.unit,
+            "; ".join(context),
+        )
+    return table
+
+
+def _render_mip_status(report: SolutionReport) -> str | None:
+    if report.problem_class != "mip" or report.selected_names is None:
+        return None
+    gap = "n/a" if report.optimality_gap is None else f"{100.0 * report.optimality_gap:.2f}%"
+    if report.termination_reason == "time_limit":
+        result = "validated feasible incumbent; optimality not proven"
+    else:
+        result = "solver-declared optimal within backend tolerance"
+    return (
+        f"[yellow]Mixed-integer solve:[/yellow] {len(report.selected_names)} names "
+        f"selected ({', '.join(report.selected_names)}); {result}; relative gap {gap}."
+    )
 
 
 def _load_named(path: Path | None, *, label: str) -> dict[str, dict[str, float]] | None:
@@ -103,6 +244,17 @@ def solve(
         "--diagnose/--no-diagnose",
         help="On infeasibility, run deterministic conflict analysis and show verified repairs.",
     ),
+    time_limit_s: float | None = typer.Option(
+        None,
+        "--time-limit-s",
+        min=0.000001,
+        help="Optional mixed-integer wall-clock limit in seconds.",
+    ),
+    json_out: Path | None = typer.Option(
+        None,
+        "--json-out",
+        help="Write the complete versioned solve report JSON to this path.",
+    ),
 ) -> None:
     """Solve the portfolio problem described in ``spec_path`` against ``prices``."""
     try:
@@ -127,6 +279,7 @@ def solve(
             sectors=sector_map,
             benchmarks=_load_named(benchmark, label="Benchmark"),
             factors=_load_named(factors, label="Factor"),
+            time_limit_s=time_limit_s,
             diagnose=diagnose,
         )
     except InfeasibleError as e:
@@ -151,59 +304,66 @@ def solve(
         raise typer.Exit(code=5) from None
 
     console.print(_render_weights(spec, [report.weights[t] for t in spec.universe]))
-    var_line = f"  ·  VaR: {report.var:.6f}" if report.var is not None else ""
+    objective_table = _render_objective(report)
+    if objective_table is not None:
+        console.print(objective_table)
+    metrics_table = _render_metrics(report)
+    if metrics_table is not None:
+        console.print(metrics_table)
+    status_label = "CVXPY adapter status" if report.problem_class == "mip" else "Status"
     console.print(
-        f"\n[bold]Objective value:[/bold] {report.objective_value:.6f}{var_line}"
-        f"  ·  [bold]Solver:[/bold] {report.solver}"
-        f"  ·  [bold]Status:[/bold] {report.status}"
-        f"  ·  [bold]Time:[/bold] {report.solve_time_ms:.1f} ms"
+        f"[bold]Solver:[/bold] {report.solver}"
+        f"  ·  [bold]{status_label}:[/bold] {report.status}"
+        f"  ·  [bold]Time:[/bold] {report.solve_time_ms:.1f} milliseconds"
     )
     if report.binding:
         console.print(_render_binding(report))
     else:
-        console.print("[dim]No constraints are binding at the optimum.[/dim]")
-    if report.duals_conditional and report.selected_names is not None:
-        gap = "n/a" if report.optimality_gap is None else f"{report.optimality_gap:.4f}"
-        console.print(
-            f"[yellow]Mixed-integer solve:[/yellow] {len(report.selected_names)} names "
-            f"selected ({', '.join(report.selected_names)}); shadow prices above are "
-            f"conditional on this selection. Optimality gap: {gap}."
-        )
+        note = report.sensitivity_note or "No material active sensitivity was reported."
+        console.print(f"[dim]{note}[/dim]")
+    mip_status = _render_mip_status(report)
+    if mip_status is not None:
+        console.print(mip_status)
+    if report.sensitivity_note and report.binding:
+        console.print(f"[dim]{report.sensitivity_note}[/dim]")
+    coverage_table = _render_sensitivity_coverage(report)
+    if coverage_table is not None:
+        console.print(coverage_table)
+    if json_out is not None:
+        json_out.write_text(report.to_json(indent=2), encoding="utf-8")
+        console.print(f"[dim]Wrote versioned solve report JSON to {json_out}.[/dim]")
 
 
 def _render_solved(report: SolutionReport, explanation: str) -> None:
     """Pretty-print a chat-mode solve: explanation, weights, binders."""
     console.print(f"\n[bold]Explanation[/bold]\n{explanation}\n")
-    weights_table = Table(title="Optimal weights")
+    weights_table = Table(title="Portfolio weights")
     weights_table.add_column("Ticker", style="bold cyan")
     weights_table.add_column("Weight", justify="right")
     weights_table.add_column("Weight %", justify="right")
     for ticker, w in report.weights.items():
         weights_table.add_row(ticker, f"{w:.6f}", f"{100.0 * w:.2f}%")
     console.print(weights_table)
+    objective_table = _render_objective(report)
+    if objective_table is not None:
+        console.print(objective_table)
+    metrics_table = _render_metrics(report)
+    if metrics_table is not None:
+        console.print(metrics_table)
     if report.binding:
-        title = (
-            "Binding constraints (conditional on selected names)"
-            if report.duals_conditional
-            else "Binding constraints"
-        )
-        binders = Table(title=title)
-        binders.add_column("Constraint", style="bold magenta")
-        binders.add_column("Shadow price", justify="right")
-        for b in report.binding:
-            binders.add_row(b.human_name, f"{b.shadow_price:.6f}")
-        console.print(binders)
-    if report.duals_conditional and report.selected_names is not None:
-        gap = "n/a" if report.optimality_gap is None else f"{report.optimality_gap:.4f}"
-        console.print(
-            f"[yellow]Mixed-integer solve:[/yellow] {len(report.selected_names)} names "
-            f"selected ({', '.join(report.selected_names)}); shadow prices are "
-            f"conditional on this selection. Optimality gap: {gap}."
-        )
-    var_line = f"  ·  VaR: {report.var:.6f}" if report.var is not None else ""
+        console.print(_render_binding(report))
+    elif report.sensitivity_note:
+        console.print(f"[dim]{report.sensitivity_note}[/dim]")
+    mip_status = _render_mip_status(report)
+    if mip_status is not None:
+        console.print(mip_status)
+    coverage_table = _render_sensitivity_coverage(report)
+    if coverage_table is not None:
+        console.print(coverage_table)
+    status_label = "CVXPY adapter status" if report.problem_class == "mip" else "status"
     console.print(
-        f"[dim]objective = {report.objective_value:.6f}{var_line}  ·  "
-        f"solver = {report.solver}  ·  time = {report.solve_time_ms:.1f} ms[/dim]"
+        f"[dim]solver = {report.solver}  ·  {status_label} = {report.status}  ·  "
+        f"time = {report.solve_time_ms:.1f} milliseconds[/dim]"
     )
 
 

@@ -177,6 +177,41 @@ def test_solve_diagnose_renders_deterministic_report_without_llm(
     assert "Type a repair number" not in output
 
 
+def test_solve_renders_typed_units_and_writes_versioned_report(tmp_path: Path) -> None:
+    spec_path, prices_path = _inputs(tmp_path)
+    json_path = tmp_path / "solve-report.json"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "solve",
+            str(spec_path),
+            "--prices",
+            str(prices_path),
+            "--json-out",
+            str(json_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Objective decomposition" in result.output
+    assert "Portfolio metrics" in result.output
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "2.0"
+    assert payload["field_units"]["objective_value"] == "objective_score"
+    assert payload["field_units"]["weights"] == "portfolio_weight_fraction"
+    assert payload["objective_decomposition"]["solver_unit"] == "objective_score"
+    assert {metric["key"] for metric in payload["metrics"]} >= {
+        "expected_return",
+        "variance",
+        "volatility",
+    }
+    variance = next(metric for metric in payload["metrics"] if metric["key"] == "variance")
+    assert variance["unit"] == "fraction_squared_per_year"
+    assert payload["sensitivities"]
+    assert all("bound_unit" in item for item in payload["sensitivities"])
+
+
 def test_backtest_command_writes_delayed_fill_tearsheet(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

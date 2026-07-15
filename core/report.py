@@ -1,37 +1,33 @@
-"""Structured solver output ready to be narrated.
+"""Versioned, typed solver output ready for deterministic or LLM narration.
 
-A ``SolutionReport`` is the *only* surface the explanation layer is allowed
-to read from. Every number in the LLM's narration must trace back to a
-field on this object (or one of the documented renderings, see
-:mod:`agent.grounding`). Building it here in deterministic Python keeps
-the trust boundary clean.
+``SolutionReport`` is the explanation layer's complete numeric trust surface.
+Schema 2.0 deliberately separates the raw solver score, financial metrics, and
+row-aware constraint sensitivities:
 
-Shadow-price sign convention (BLUEPRINT §5 — "duals everywhere"):
+* ``objective_decomposition`` records the mathematical terms that form the
+  minimized score, including transforms and transaction-cost penalties;
+* ``metrics`` carries financial definitions, units, horizons, and objective-
+  appropriate values; and
+* ``sensitivities`` preserves constraint row, side, dual sign, transform scale,
+  primal slack, conditionality, and compound units.
 
-* For an *inequality* constraint of the form ``g(w) >= 0`` (Truffle's
-  encoding: long-only, the stacked-slack form of Box), the dual ``λ`` is
-  non-negative; ``λ > 0`` indicates the constraint is binding and tells
-  you how much the objective would improve per unit relaxation of the
-  binding side. We report the max-magnitude entry per constraint
-  (see :func:`core.duals.harvest_duals`).
-* For an *equality* constraint (Budget), the dual is signed; the magnitude
-  is the shadow price, the sign indicates which direction relaxes the
-  optimum. The narration reports magnitude only (and so MUST NOT claim a
-  sign that the report does not contain).
-
-Threshold for "binding" matches the duals module: a magnitude of
-``1e-6`` or less is treated as non-binding to avoid surfacing
-floating-point noise.
+``objective_value``, ``var``, and ``binding`` remain compatibility fields.
+``binding`` is now derived only from rows that are both primally active and
+materially sensitive; it must not replace the authoritative row records.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import math
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.patch import SpecPatch
+from core.report_semantics import ObjectiveDecomposition, PortfolioMetric
+from core.sensitivity import SensitivityCoverage, SensitivityRecord
 
 BINDING_THRESHOLD = 1e-6
 
@@ -148,11 +144,19 @@ class ConflictReport(_DiagnosticModel):
 
 @dataclass(frozen=True)
 class BindingConstraint:
-    """One row of the binding-constraints section of the report."""
+    """Deprecated impact summary retained for API compatibility.
+
+    Row-aware consumers should use :attr:`SolutionReport.sensitivities`. The
+    optional row fields prevent this adapter from erasing which side and unit
+    produced the summarized shadow price.
+    """
 
     constraint_id: str
     human_name: str
     shadow_price: float
+    row_label: str | None = None
+    side: Literal["lower", "upper", "equality"] | None = None
+    sensitivity_unit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,8 +167,9 @@ class SolutionReport:
         weights: ``{ticker -> weight}`` in canonical universe order.
         objective_kind: The IR objective ``kind`` discriminator
             (``"min_variance"`` / ``"mean_variance"`` / ``"min_cvar"``).
-        objective_value: The solved objective value (variance, MV penalty,
-            or CVaR depending on the objective).
+        objective_value: Compatibility field containing the raw minimized
+            solver score. Use ``objective_decomposition`` and ``metrics`` for
+            meaning; this value can include penalties or a transformed score.
         var: Optimal ``t`` for ``min_cvar``; ``None`` otherwise. Reported
             so the explanation can say "VaR(α=0.95) = X" without re-running
             the solver.
@@ -172,23 +177,27 @@ class SolutionReport:
         solve_time_ms: Wall-clock solve time in milliseconds.
         status: CVXPY status string (``"optimal"`` /
             ``"optimal_inaccurate"`` after a successful run).
-        binding: Constraints whose absolute shadow price exceeds
-            :data:`BINDING_THRESHOLD`, sorted by descending magnitude. The
-            grounder will not allow the narration to reference any number
-            not in this list (or in the other report fields).
+        binding: Compatibility summary of materially sensitive, primally active
+            rows, sorted by derivative magnitude. ``sensitivities`` is the
+            authoritative signed and unit-aware surface.
         n_assets: Universe size; useful for sanity-checking "k of n names".
-        nonzero_names: Tickers with weight magnitude above a small floor —
-            so the narration may say "13 names selected" without that
-            number being a hallucination.
-        duals_conditional: ``True`` when the shadow prices come from the MIP
-            fix-and-resolve restriction (conditional on the selected name set)
-            rather than an ordinary convex solve. The narration MUST state the
-            conditionality when this is set (see ``explain_system.md``).
+        nonzero_names: Tickers with weight magnitude above a small floor. This
+            is a position count, not the mixed-integer selected-set count.
+        duals_conditional: Compatibility flag set only when reported
+            sensitivities come from a MIP fix-and-resolve restriction. Use
+            ``problem_class`` to identify MIPs that have no sensitivities.
         selected_names: For a mixed-integer (cardinality) solve, the names the
             integer program selected. ``None`` on the continuous path.
-        optimality_gap: For a mixed-integer solve, the solver's proven
-            optimality gap (~0 at ``optimal``; nonzero only if a time limit cut
-            the search short). ``None`` on the continuous path.
+        optimality_gap: Backend-reported relative MIP gap. Zero is inferred only
+            from a proven optimum when the backend omits the statistic.
+        objective_decomposition: Typed reconstruction of the solver score.
+        metrics: Objective-appropriate portfolio statistics with units.
+        sensitivities: One signed record per named constraint row.
+        sensitivity_coverage: Per-constraint availability and reason.
+        termination_reason: Proven optimum or verified time-limit stop.
+        optimality_proven: Whether the MIP backend proved optimality.
+        incumbent_validated: Whether a complete MIP primal passed validation.
+        problem_class: Continuous-convex or mixed-integer solve path.
     """
 
     weights: dict[str, float]
@@ -204,6 +213,117 @@ class SolutionReport:
     duals_conditional: bool = False
     selected_names: list[str] | None = None
     optimality_gap: float | None = None
+    objective_decomposition: ObjectiveDecomposition | None = None
+    metrics: tuple[PortfolioMetric, ...] = ()
+    sensitivities: tuple[SensitivityRecord, ...] = ()
+    sensitivity_coverage: dict[str, SensitivityCoverage] = field(default_factory=dict)
+    sensitivity_note: str | None = None
+    termination_reason: Literal["optimal", "optimal_inaccurate", "time_limit"] = "optimal"
+    optimality_proven: bool = True
+    incumbent_validated: bool = False
+    problem_class: Literal["convex", "mip"] = "convex"
+    schema_version: Literal["2.0"] = "2.0"
+
+    def __post_init__(self) -> None:
+        if self.optimality_gap is not None and (
+            not math.isfinite(self.optimality_gap) or self.optimality_gap < 0.0
+        ):
+            raise ValueError("optimality_gap must be a finite non-negative relative fraction.")
+
+        if self.selected_names is not None:
+            if not self.selected_names:
+                raise ValueError("selected_names must be non-empty when reported.")
+            if len(set(self.selected_names)) != len(self.selected_names):
+                raise ValueError("selected_names must not contain duplicates.")
+            unknown_names = set(self.selected_names).difference(self.weights)
+            if unknown_names:
+                raise ValueError(
+                    "selected_names must be drawn from the report's weight universe."
+                )
+
+        sensitivity_modes = {record.conditional for record in self.sensitivities}
+        if len(sensitivity_modes) > 1:
+            raise ValueError(
+                "A report cannot mix conditional and unconditional sensitivity records."
+            )
+        records_are_conditional = sensitivity_modes == {True}
+        if self.duals_conditional != records_are_conditional:
+            raise ValueError(
+                "duals_conditional must be true exactly when the report contains "
+                "conditional sensitivity records."
+            )
+
+        if self.termination_reason == "optimal" and not self.optimality_proven:
+            raise ValueError("An optimal report must have optimality_proven=True.")
+        if self.termination_reason != "optimal" and self.optimality_proven:
+            raise ValueError(
+                "optimal_inaccurate and time_limit reports require optimality_proven=False."
+            )
+
+        if self.problem_class == "convex":
+            if self.selected_names is not None:
+                raise ValueError("A convex report cannot contain selected_names.")
+            if self.optimality_gap is not None:
+                raise ValueError("A convex report cannot contain a MIP optimality_gap.")
+            if self.incumbent_validated:
+                raise ValueError("incumbent_validated applies only to MIP reports.")
+            if records_are_conditional:
+                raise ValueError("A convex report cannot contain conditional sensitivities.")
+            if self.termination_reason == "time_limit":
+                raise ValueError("time_limit termination is supported only for MIP reports.")
+            return
+
+        if self.selected_names is None:
+            raise ValueError("A MIP report requires a non-empty selected_names set.")
+        if self.optimality_gap is None:
+            raise ValueError("A MIP report requires a finite relative optimality_gap.")
+        if not self.incumbent_validated:
+            raise ValueError("A MIP report requires a validated incumbent.")
+        if self.termination_reason == "optimal_inaccurate":
+            raise ValueError("optimal_inaccurate is not a supported MIP termination reason.")
+        if self.sensitivities and not records_are_conditional:
+            raise ValueError("MIP sensitivity records must be conditional.")
+        if self.binding and not self.sensitivities:
+            raise ValueError(
+                "A MIP report cannot contain binding summaries without authoritative "
+                "conditional sensitivity records."
+            )
+        if self.termination_reason == "time_limit" and (
+            self.sensitivities or self.binding
+        ):
+            raise ValueError(
+                "A time-limit report cannot contain sensitivity data because "
+                "fix-and-resolve could optimize a different portfolio."
+            )
+
+    def metric(self, key: str) -> PortfolioMetric | None:
+        """Return one typed portfolio metric by stable key."""
+
+        return next((metric for metric in self.metrics if metric.key == key), None)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the complete deterministic, JSON-serializable report."""
+
+        payload = asdict(self)
+        payload["field_units"] = {
+            "weights": "portfolio_weight_fraction",
+            "objective_value": "objective_score",
+            "solve_time_ms": "milliseconds",
+            "var": (
+                "fraction_per_scenario_period" if self.var is not None else None
+            ),
+            "optimality_gap": (
+                "relative_fraction" if self.optimality_gap is not None else None
+            ),
+            "n_assets": "count",
+            "nonzero_names": "count",
+        }
+        return payload
+
+    def to_json(self, *, indent: int | None = 2) -> str:
+        """Serialize the versioned report without a custom encoder."""
+
+        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
 
 
 def build_report(
@@ -221,6 +341,15 @@ def build_report(
     duals_conditional: bool = False,
     selected_names: list[str] | None = None,
     optimality_gap: float | None = None,
+    objective_decomposition: ObjectiveDecomposition | None = None,
+    metrics: tuple[PortfolioMetric, ...] = (),
+    sensitivities: tuple[SensitivityRecord, ...] = (),
+    sensitivity_coverage: dict[str, SensitivityCoverage] | None = None,
+    sensitivity_note: str | None = None,
+    termination_reason: Literal["optimal", "optimal_inaccurate", "time_limit"] = "optimal",
+    optimality_proven: bool = True,
+    incumbent_validated: bool = False,
+    problem_class: Literal["convex", "mip"] = "convex",
 ) -> SolutionReport:
     """Assemble a ``SolutionReport`` from solver outputs and the IR id map.
 
@@ -241,15 +370,35 @@ def build_report(
         nonzero_floor: Weights below this magnitude are treated as zero
             for the ``nonzero_names`` count.
     """
-    binding = [
-        BindingConstraint(
-            constraint_id=cid,
-            human_name=constraint_human_names.get(cid, cid),
-            shadow_price=val,
-        )
-        for cid, val in duals.items()
-        if abs(val) > BINDING_THRESHOLD
-    ]
+    if sensitivities:
+        binding = []
+        for record in sensitivities:
+            shadow_price = abs(record.objective_derivative_per_bound_unit)
+            if not record.is_binding or shadow_price <= BINDING_THRESHOLD:
+                continue
+            sensitivity_unit = f"{record.objective_unit}_per_{record.bound_unit}"
+            binding.append(
+                BindingConstraint(
+                    constraint_id=record.constraint_id,
+                    human_name=constraint_human_names.get(
+                        record.constraint_id, record.constraint_id
+                    ),
+                    shadow_price=shadow_price,
+                    row_label=record.row_label,
+                    side=record.side,
+                    sensitivity_unit=sensitivity_unit,
+                )
+            )
+    else:
+        binding = [
+            BindingConstraint(
+                constraint_id=cid,
+                human_name=constraint_human_names.get(cid, cid),
+                shadow_price=val,
+            )
+            for cid, val in duals.items()
+            if abs(val) > BINDING_THRESHOLD
+        ]
     binding.sort(key=lambda b: -abs(b.shadow_price))
     nonzero_names = sum(1 for w in weights.values() if abs(w) > nonzero_floor)
     return SolutionReport(
@@ -266,4 +415,13 @@ def build_report(
         duals_conditional=duals_conditional,
         selected_names=selected_names,
         optimality_gap=optimality_gap,
+        objective_decomposition=objective_decomposition,
+        metrics=tuple(metrics),
+        sensitivities=tuple(sensitivities),
+        sensitivity_coverage=dict(sensitivity_coverage or {}),
+        sensitivity_note=sensitivity_note,
+        termination_reason=termination_reason,
+        optimality_proven=optimality_proven,
+        incumbent_validated=incumbent_validated,
+        problem_class=problem_class,
     )

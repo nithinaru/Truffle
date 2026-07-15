@@ -12,12 +12,15 @@ We build a SolutionReport by hand, then check:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from agent.explain import explain, template_summary
 from agent.grounding import verify
 from core.exceptions import GroundingFailedError
 from core.report import BindingConstraint, SolutionReport
+from core.report_semantics import PortfolioMetric
 
 
 def _report() -> SolutionReport:
@@ -40,13 +43,12 @@ def _report() -> SolutionReport:
     )
 
 
-def test_verify_accepts_correct_explanation_with_percent_and_bps() -> None:
+def test_verify_accepts_correct_explanation_with_typed_raw_sensitivities() -> None:
     r = _report()
-    # 0.0264 -> 2.64% and 264 bps; 0.056272 -> 5.6272%; 4 of 5 names.
     text = (
         "The minimum-variance solve produced an objective value of 0.023513. "
-        "The AAA position cap is binding with a shadow price of about 264 bps. "
-        "The budget constraint also binds, shadow price 5.6272%. "
+        "The AAA position cap is binding with a sensitivity magnitude of 0.026418. "
+        "The budget constraint also binds with sensitivity magnitude 0.056272. "
         "4 of 5 names received nonzero weight."
     )
     res = verify(text, r)
@@ -89,6 +91,108 @@ def test_verify_allows_small_integers_for_counts() -> None:
     assert res.ok, res.unmatched
 
 
+def test_solution_grounding_enforces_metric_units() -> None:
+    report = replace(
+        _report(),
+        objective_value=0.9,
+        weights={"AAA": 0.35, "BBB": 0.65},
+        n_assets=2,
+        nonzero_names=2,
+        binding=[],
+        metrics=(
+            PortfolioMetric(
+                key="variance",
+                label="Portfolio variance",
+                value=0.04,
+                unit="fraction_squared_per_year",
+                definition="annualized portfolio variance",
+            ),
+            PortfolioMetric(
+                key="expected_return",
+                label="Expected return",
+                value=0.08,
+                unit="fraction_per_year",
+                definition="annualized expected return",
+            ),
+        ),
+    )
+    assert verify("Variance is 0.04 and expected return is 8%.", report).ok
+    rejected = verify("Variance is 4%.", report)
+    assert not rejected.ok
+    assert "4%" in rejected.unmatched
+
+    cross_field = verify("Variance is 8%.", report)
+    assert not cross_field.ok
+    assert "8%" in cross_field.unmatched
+
+    ambiguous = replace(
+        report,
+        metrics=(
+            replace(report.metrics[0], value=0.08),
+            report.metrics[1],
+        ),
+    )
+    # Explicit field labels disambiguate equal raw values with different units.
+    assert verify("Expected return is 8%.", ambiguous).ok
+    assert not verify("Variance is 8%.", ambiguous).ok
+
+
+def test_solution_grounding_does_not_convert_sensitivity_rates_to_bps() -> None:
+    report = replace(
+        _report(),
+        # A real 40% weight must not authorize percentage or bps renderings of
+        # an unrelated raw sensitivity derivative.
+        weights={"AAA": 0.4, "BBB": 0.6},
+        n_assets=2,
+        nonzero_names=2,
+        objective_value=0.9,
+        binding=[
+            BindingConstraint(
+                "cap",
+                "the cap",
+                0.001,
+                row_label="AAA",
+                side="upper",
+                sensitivity_unit="annualized_variance_per_portfolio_weight_fraction",
+            )
+        ],
+    )
+    assert verify("The signed sensitivity magnitude is 0.001.", report).ok
+    assert verify("The portfolio weight is 40%.", report).ok
+    for prose, rendered in (
+        ("The sensitivity is 40%.", "40%"),
+        ("The sensitivity is 4000 bps.", "4000bps"),
+    ):
+        rejected = verify(prose, report)
+        assert not rejected.ok
+        assert rendered in rejected.unmatched
+
+
+def test_relative_gap_allows_percent_but_not_basis_points() -> None:
+    report = replace(
+        _report(),
+        problem_class="mip",
+        selected_names=["AAA", "BBB", "CCC", "DDD"],
+        optimality_gap=0.125,
+        incumbent_validated=True,
+        binding=[],
+    )
+    assert verify("The relative gap is 12.5%.", report).ok
+    assert not verify("The relative gap is 1250 bps.", report).ok
+
+
+def test_unreported_small_integer_is_not_globally_allowlisted() -> None:
+    result = verify("There are 12 constraints.", _report())
+    assert not result.ok
+    assert "12" in result.unmatched
+
+
+def test_reported_count_cannot_ground_an_unrelated_field() -> None:
+    result = verify("The Sharpe ratio is 5.", _report())
+    assert not result.ok
+    assert "5" in result.unmatched
+
+
 def test_template_summary_is_self_grounded() -> None:
     r = _report()
     text = template_summary(r)
@@ -113,8 +217,8 @@ def test_explain_succeeds_with_grounded_response() -> None:
     r = _report()
     good = (
         "Minimum-variance solve, objective value 0.023513. "
-        "Two constraints bind: the budget (shadow price 5.6272%) and "
-        "the AAA position cap (264 bps). 4 of 5 names hold weight."
+        "Two constraints bind: the budget (sensitivity 0.056272) and "
+        "the AAA position cap (sensitivity 0.026418). 4 of 5 names hold weight."
     )
     client = _FakeTextClient([good])
     text, result = explain(r, client=client)

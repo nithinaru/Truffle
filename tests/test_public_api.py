@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import typing
 from collections.abc import Mapping
 from functools import partial
 
@@ -49,7 +50,12 @@ def test_public_all_is_deliberate_and_resolves() -> None:
         "ConflictReport",
         "DiagnosisError",
         "InfeasibleError",
+        "ObjectiveDecomposition",
+        "ObjectiveTerm",
         "PortfolioSpec",
+        "PortfolioMetric",
+        "SensitivityCoverage",
+        "SensitivityRecord",
         "SolutionReport",
         "SolverError",
         "SpecInput",
@@ -64,6 +70,8 @@ def test_public_all_is_deliberate_and_resolves() -> None:
     assert set(truffle.__all__) == expected
     assert all(hasattr(truffle, name) for name in truffle.__all__)
     assert truffle.ValidationError is ValidationError
+    hints = typing.get_type_hints(SolutionReport)
+    assert hints["sensitivities"] == tuple[truffle.SensitivityRecord, ...]
 
 
 def test_solve_accepts_mapping_validates_it_and_matches_core() -> None:
@@ -79,6 +87,13 @@ def test_solve_accepts_mapping_validates_it_and_matches_core() -> None:
     assert report.status == core_report.status
     assert report.solver == core_report.solver
     assert report.n_assets == core_report.n_assets
+    assert report.schema_version == "2.0"
+    assert report.problem_class == "convex"
+    assert isinstance(report.objective_decomposition, truffle.ObjectiveDecomposition)
+    assert all(isinstance(metric, truffle.PortfolioMetric) for metric in report.metrics)
+    assert all(
+        isinstance(record, truffle.SensitivityRecord) for record in report.sensitivities
+    )
     np.testing.assert_allclose(report.objective_value, core_report.objective_value)
     np.testing.assert_allclose(
         list(report.weights.values()),

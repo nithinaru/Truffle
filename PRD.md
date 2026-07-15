@@ -1,11 +1,11 @@
 # Truffle Product Requirements
 
 **Status:** Active  
-**Version:** 1.1
+**Version:** 1.2
 **Last updated:** 2026-07-15
 **Primary branch:** `main`
-**Current checkpoint:** Sprint 1 is complete locally and awaits the owner's push
-and remote CI confirmation.
+**Current checkpoint:** Sprint 2 is complete locally and awaits the owner's push
+and remote Python 3.12 CI confirmation.
 
 This document is the source of truth for Truffle's remaining product work. The
 original [project blueprint](BLUEPRINT.md) remains useful design history; this
@@ -219,10 +219,8 @@ performance/drawdown review pass.
 - Read-only Alpaca IEX data adapter with official calendar and source provenance.
 - Offline parse-scoring infrastructure and a 12-case starter corpus.
 
-### Known blockers
+### Remaining blockers
 
-- Objective and shadow-price reporting need typed decomposition and units.
-- Time-limited MIP incumbent handling does not match the advertised behavior.
 - Clarification context and some patch semantics are incomplete.
 - No downstream natural-language operation router exists.
 - Live shadow is a library workflow, not yet an operator command or deployed run.
@@ -262,8 +260,8 @@ confirm the GitHub-hosted run.
 **Exit:** invalid numerical state cannot reach CVXPY, and transformed objectives
 cannot return weights inconsistent with the confirmed budget.
 
-**Status:** Local acceptance complete on 2026-07-15; owner push and remote CI are
-pending. The implementation now:
+**Status:** Complete. The owner-pushed commit `1d81a52` passed the GitHub-hosted
+Python 3.12 CI run on 2026-07-15. The implementation:
 
 - rejects NaN and infinity at typed-IR construction and revalidates the complete
   specification at compilation;
@@ -275,9 +273,9 @@ pending. The implementation now:
   while rejecting every explicit non-unit budget; and
 - covers the trust boundary with direct and parameterized regression tests.
 
-Local evidence: all 554 tests pass under Python 3.12 with the `mip` extra and
-SCIP, and repository-wide Ruff lint passes. Remote CI remains the sprint-closing
-gate.
+Acceptance evidence: all 554 tests passed under Python 3.12 with the `mip` extra
+and SCIP, repository-wide Ruff lint passed, and GitHub Actions run `29454520792`
+completed successfully.
 
 ### Sprint 2 - Solver and report semantics
 
@@ -288,6 +286,38 @@ gate.
 
 **Exit:** every displayed metric has a tested definition and unit; time-limited
 results are either validated incumbents or explicit failures.
+
+**Status:** Local acceptance complete on 2026-07-15; owner push and remote CI are
+pending. The implementation now:
+
+- publishes versioned `SolutionReport` schema `2.0`, with objective terms kept
+  separate from objective-appropriate portfolio metrics for all six objectives;
+- distinguishes annualized log-return moments, annualized variance/volatility,
+  scenario-period VaR/CVaR, tracking error, Sharpe, risk-contribution deviation,
+  L1 turnover, modeled cost, and transformed solver scores by explicit unit and
+  definition;
+- preserves every sensitivity row's constraint, ticker/label, side, bound,
+  primal value, slack, raw dual, signed bound derivative, transform scale,
+  objective unit, and conditionality, with explicit coverage reasons where a
+  meaningful dual does not exist;
+- suppresses non-identifiable multipliers from linearly dependent active rows,
+  withholds derivatives from approximate solves, filters fixed-name rows with
+  no selected-name support, and attaches conditional MIP sensitivities only
+  when fix-and-resolve reproduces the reported portfolio;
+- verifies backend-native MIP termination, every returned variable/domain,
+  binary integrality, every model constraint, recovered weights, recomputed
+  objective, and finite relative gap before reporting a time-limited incumbent;
+- exposes typed CLI tables, `--time-limit-s`, deterministic solve-report JSON,
+  field- and unit-aware LLM grounding, deterministic fallback wording,
+  cross-field report invariants, and updated public report types/documentation;
+  and
+- fails closed on missing/malformed dual rows, ambiguous unit conversions,
+  unreported small integers, invalid gap sentinels, and incomplete or infeasible
+  MIP primals.
+
+Local evidence: all 627 tests pass under Python 3.13 with Clarabel, HiGHS, and
+SCIP installed; repository-wide Ruff lint and `git diff --check` pass. The
+GitHub-hosted Python 3.12 run remains the sprint-closing gate.
 
 ### Sprint 3 - Conversational and workflow correctness
 

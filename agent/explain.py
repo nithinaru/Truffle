@@ -9,9 +9,7 @@ in the report, by construction.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 from agent.client import LLMClient
 from agent.grounding import GroundingResult, verify
@@ -27,22 +25,7 @@ def _load_system_prompt() -> str:
 
 def _report_as_json(report: SolutionReport) -> str:
     """Serialize the report for the model's context."""
-    data: dict[str, Any] = {
-        "weights": report.weights,
-        "objective_kind": report.objective_kind,
-        "objective_value": report.objective_value,
-        "var": report.var,
-        "solver": report.solver,
-        "solve_time_ms": report.solve_time_ms,
-        "status": report.status,
-        "n_assets": report.n_assets,
-        "nonzero_names": report.nonzero_names,
-        "binding": [asdict(b) for b in report.binding],
-        "duals_conditional": report.duals_conditional,
-        "selected_names": report.selected_names,
-        "optimality_gap": report.optimality_gap,
-    }
-    return json.dumps(data, indent=2)
+    return json.dumps(report.to_dict(), indent=2)
 
 
 def template_summary(report: SolutionReport) -> str:
@@ -52,31 +35,95 @@ def template_summary(report: SolutionReport) -> str:
         "min_variance": "Minimum-variance",
         "mean_variance": "Mean-variance",
         "min_cvar": "Minimum-CVaR",
+        "max_sharpe": "Maximum-Sharpe",
+        "risk_parity": "Risk-parity",
+        "min_tracking_error": "Minimum-tracking-error",
     }.get(report.objective_kind, report.objective_kind)
-    lines.append(
-        f"{obj_phrase} solve returned status {report.status} on the {report.n_assets}-asset universe "
-        f"in {report.solve_time_ms:.1f} ms using {report.solver}."
+    status_label = (
+        "CVXPY adapter status"
+        if report.problem_class == "mip" or report.selected_names is not None
+        else "status"
     )
-    lines.append(f"Objective value: {report.objective_value:.6f}.")
-    if report.var is not None:
-        lines.append(f"VaR at the optimum: {report.var:.6f}.")
+    lines.append(
+        f"{obj_phrase} solve returned {status_label} {report.status} on the "
+        f"{report.n_assets}-asset universe in {report.solve_time_ms:.1f} ms "
+        f"using {report.solver}."
+    )
+    if report.objective_decomposition is None:
+        lines.append(f"Objective value: {report.objective_value:.6f}.")
+        if report.var is not None:
+            lines.append(f"VaR at the optimum: {report.var:.6f}.")
+    else:
+        objective = report.objective_decomposition
+        lines.append(
+            f"Solver objective score: {objective.solver_value:.6f} "
+            f"{objective.solver_unit}."
+        )
+        if report.metrics:
+            rendered_metrics = ", ".join(
+                f"{metric.label} {metric.value:.6f} {metric.unit}"
+                for metric in report.metrics
+            )
+            lines.append(f"Portfolio metrics: {rendered_metrics}.")
     lines.append(f"Nonzero positions: {report.nonzero_names} of {report.n_assets}.")
-    if report.duals_conditional:
+    if report.problem_class == "mip" or report.selected_names is not None:
         # A MIP solve: name the selected count and flag the conditionality up
         # front so the deterministic fallback also honours the Slice-3 rule.
-        lines.append(
-            f"This is a mixed-integer (cardinality) solve: {report.nonzero_names} names "
-            "were selected, and the shadow prices below are conditional — they hold "
-            "with the selected names held fixed, not globally."
-        )
+        selected_count = len(report.selected_names or [])
+        if report.duals_conditional and (report.sensitivities or report.binding):
+            lines.append(
+                "This is a mixed-integer (cardinality) solve: "
+                f"{selected_count} names were selected, and the sensitivities below are "
+                "conditional — they hold with the selected names held fixed, not globally."
+            )
+        else:
+            lines.append(
+                "This is a mixed-integer (cardinality) solve: "
+                f"{selected_count} names were selected."
+            )
+        if report.termination_reason == "time_limit":
+            if report.optimality_gap is None:
+                lines.append(
+                    "The time-limit result has no validated relative gap and must "
+                    "not be treated as an optimal portfolio."
+                )
+            else:
+                lines.append(
+                    "The solver stopped at the time limit with a validated feasible "
+                    f"incumbent; optimality was not proven and the relative gap is "
+                    f"{report.optimality_gap:.6f}."
+                )
+        elif report.optimality_gap is not None:
+            lines.append(
+                f"The solver declared optimality within backend tolerance with relative gap "
+                f"{report.optimality_gap:.6f}."
+            )
     if report.binding:
-        binders = ", ".join(
-            f"{b.human_name} (shadow price {b.shadow_price:.6f})" for b in report.binding
-        )
+        binders: list[str] = []
+        for binding in report.binding:
+            row = (
+                ""
+                if binding.row_label is None or binding.side is None
+                else f", row {binding.row_label} {binding.side}"
+            )
+            unit = (
+                ""
+                if binding.sensitivity_unit is None
+                else f" {binding.sensitivity_unit}"
+            )
+            binders.append(
+                f"{binding.human_name}{row} "
+                f"(shadow price {binding.shadow_price:.6f}{unit})"
+            )
         prefix = "Conditional binding constraints" if report.duals_conditional else "Binding constraints"
-        lines.append(f"{prefix}: {binders}.")
+        lines.append(f"{prefix}: {', '.join(binders)}.")
     else:
-        lines.append("No constraints are binding at the optimum (all shadow prices ~ 0).")
+        if report.sensitivity_note:
+            lines.append(report.sensitivity_note)
+        elif report.sensitivities:
+            lines.append("No reported constraint row has a material sensitivity.")
+        else:
+            lines.append("No row-aware constraint sensitivities are available for this solve.")
     return " ".join(lines)
 
 

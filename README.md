@@ -1,6 +1,6 @@
 # Truffle
 
-**Describe your portfolio in plain English. Truffle unearths the optimal allocation — and tells you exactly what each constraint costs you.**
+**Describe your portfolio in plain English. Truffle unearths the allocation and reports exactly what the solver proved.**
 
 Current product requirements and the staged delivery plan live in [PRD.md](PRD.md).
 
@@ -15,7 +15,9 @@ Current product requirements and the staged delivery plan live in [PRD.md](PRD.m
 
 Truffle is a natural-language portfolio optimizer. You state your objective and constraints however you'd say them out loud; Truffle translates that into a verified mathematical program, solves it with a real convex/mixed-integer solver, and hands you back an allocation **plus** the things most tools hide:
 
-- **What's binding** — which of your constraints are actually limiting you, with shadow prices ("your 30% tech cap is costing ~11bps of expected annual return").
+- **What's binding** — the exact constraint row, ticker, and lower/upper side,
+  together with a signed local objective derivative and explicit numerator and
+  bound units. Truffle does not relabel a variance sensitivity as return bps.
 - **What conflicts** — when your constraints are mutually infeasible, Truffle can run
   deterministic conflict analysis and offer only repairs that it has re-solved successfully.
 - **What it would do out-of-sample** — a local walk-forward backtest uses trailing
@@ -37,7 +39,8 @@ paths can be exercised without an API key or network access:
 # A single allocation; --diagnose is opt-in if the spec proves infeasible.
 truffle solve examples/spec_minvar.yaml \
   --prices examples/prices_sample.csv \
-  --diagnose
+  --diagnose \
+  --json-out /tmp/truffle-solve-report.json
 
 # Monthly walk-forward evaluation with a next-observed-close fill.
 truffle backtest examples/spec_minvar.yaml \
@@ -56,7 +59,12 @@ truffle backtest examples/spec_minvar.yaml \
 - Proper covariance estimation (Ledoit–Wolf shrinkage) and historical CVaR scenarios
 - A fail-closed numerical boundary for finite IR/data inputs and symmetric PSD covariance
 - Seeded IID and contiguous-block bootstrap scenario APIs, with explicit horizon units
-- Shadow-price explanations grounded in real solver duals — every number is verified against solver output
+- Row-aware, unit-aware sensitivity records grounded in solver duals, with
+  primal slack and binding state kept separate
+- Typed objective decomposition and objective-appropriate metrics for all six
+  objective kinds; transformed solver scores are never mislabeled as financial metrics
+- Validated time-limited MIP incumbents with backend-native relative gaps;
+  missing or infeasible candidates fail closed
 - Opt-in infeasibility diagnosis via normalized elastic relaxation and deletion filtering
 - Verified repairs: every suggested patch is re-solved before it is offered
 - No-lookahead walk-forward backtesting with drifted holdings, proportional costs,
@@ -121,7 +129,9 @@ cover those, both free:
 
 ```bash
 # Solve from a YAML spec (no LLM needed — the deterministic core)
-truffle solve examples/spec_minvar.yaml --prices examples/prices_sample.csv
+truffle solve examples/spec_minvar.yaml \
+  --prices examples/prices_sample.csv \
+  --json-out /tmp/truffle-solve-report.json
 
 # Run the local historical backtester and retain its complete JSON result
 truffle backtest examples/spec_minvar.yaml \
@@ -157,6 +167,30 @@ This facade does not interpret natural language, fetch data, create an LLM
 client, or hide typed solver failures. The confirmed chat workflow remains the
 only natural-language entrypoint.
 
+### Solve-report semantics
+
+`SolutionReport` schema `2.0` separates three surfaces:
+
+- `objective_decomposition` reconstructs the scalar `objective_score` from
+  base, reward, transform, and penalty terms. `objective_value` remains a
+  compatibility alias for the raw solver score; it is not necessarily variance,
+  CVaR, or Sharpe.
+- `metrics` contains financial quantities with definitions, units, and horizon
+  context—for example annualized variance and volatility, scenario-period
+  VaR/CVaR, Sharpe ratio, tracking error, or risk-contribution deviation.
+- `sensitivities` preserves every named solver row, its ticker/label, side,
+  bound, primal value, slack, raw dual, parameter scale, signed objective
+  derivative, and compound unit. `sensitivity_coverage` explains rows that have
+  no meaningful dual, including transaction-cost penalties, cardinality, and
+  implicit transformed constraints.
+
+For a MIP stopped by `--time-limit-s`, Truffle reports a result only after
+validating every primal variable, binary selector, declared variable domain,
+model constraint, recovered weight, objective, termination reason, and finite
+backend relative gap. Such a report is labeled a feasible incumbent—not an
+optimum—and omits conditional sensitivities because fix-and-resolve could
+optimize a different portfolio.
+
 ## How it works
 
 ```
@@ -174,7 +208,7 @@ only natural-language entrypoint.
         v
   [ Solver ]  -- Clarabel (convex) / HiGHS or SCIP (mixed-integer)
         |
-        +--> duals & shadow prices --> [ Explainer ] (grounded narration)
+        +--> typed metrics & row sensitivities --> [ Explainer ] (unit-aware grounding)
         +--> infeasible? ----------> [ Diagnoser ] (elastic relaxation)
         +--> [ Backtester ] (walk-forward, delayed fills, transaction costs)
 ```
@@ -341,8 +375,9 @@ explicit live run are still required before publishing one.
 ## Roadmap
 
 - [x] **Cardinality / max-names limits** (big-M MIP) — shipped. A "max N names"
-  limit routes to a mixed-integer solver (HiGHS for MILP, SCIP for MIQP/MISOCP) and
-  returns **conditional** shadow prices (see below).
+  limit routes to a mixed-integer solver (HiGHS for MILP, SCIP for MIQP/MISOCP)
+  and returns row-aware sensitivities conditional on the fixed selection when
+  the MIP optimum and conditional portfolio agree (see below).
 - [x] **Infeasibility diagnosis** — normalized elastic relaxation, verified
   node-level IIS extraction, and ranked repairs that are re-solved before display.
 - [x] **Walk-forward backtester** — delayed fills, drift, costs, deterministic
@@ -370,11 +405,13 @@ explicit live run are still required before publishing one.
 
 ### Current limitations
 
-- **Cardinality shadow prices are conditional.** A mixed-integer optimum has no
+- **Cardinality sensitivities are conditional.** A mixed-integer optimum has no
   native dual variables, so Truffle prices the constraints by fixing the chosen
   names (re-solving the continuous restriction) and harvesting *that* problem's
-  duals. The reported shadow prices are therefore valid *given the selected name
-  set*, not global sensitivities — the explanation states this explicitly.
+  duals. The reported rows are therefore valid *given the selected name set*,
+  not global sensitivities. If the restricted optimizer differs from the
+  reported MIP portfolio, or the MIP stopped at a time limit, sensitivities are
+  marked unavailable instead of being attached to the wrong weights.
   Cardinality currently composes with min-variance / mean-variance (MIQP) and
   min-CVaR (MILP), under a long-only book.
 - **No broker execution.** The backtester and `$100` replay remain local. The

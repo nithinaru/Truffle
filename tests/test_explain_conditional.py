@@ -11,6 +11,27 @@ from __future__ import annotations
 from agent.explain import explain, template_summary
 from agent.grounding import verify
 from core.report import BindingConstraint, SolutionReport
+from core.sensitivity import SensitivityRecord
+
+
+def _conditional_sensitivity(*, objective_unit: str) -> SensitivityRecord:
+    return SensitivityRecord(
+        constraint_id="tech",
+        kind="group_cap",
+        row_index=0,
+        row_label="Tech",
+        side="upper",
+        bound_value=0.50,
+        bound_unit="portfolio_weight_fraction",
+        raw_solver_dual=0.0011,
+        parameter_scale=1.0,
+        objective_derivative_per_bound_unit=-0.0011,
+        objective_unit=objective_unit,
+        primal_value=0.50,
+        slack=0.0,
+        is_binding=True,
+        conditional=True,
+    )
 
 
 def _conditional_report() -> SolutionReport:
@@ -27,6 +48,11 @@ def _conditional_report() -> SolutionReport:
         duals_conditional=True,
         selected_names=["AAA", "CCC", "DDD"],
         optimality_gap=0.0,
+        sensitivities=(
+            _conditional_sensitivity(objective_unit="annualized_variance"),
+        ),
+        incumbent_validated=True,
+        problem_class="mip",
     )
 
 
@@ -85,9 +111,46 @@ def test_conditional_count_passes_grounding_when_selected_only() -> None:
         duals_conditional=True,
         selected_names=[f"T{i}" for i in range(13)],
         optimality_gap=0.0,
+        sensitivities=(
+            _conditional_sensitivity(objective_unit="scenario_loss_fraction"),
+        ),
+        incumbent_validated=True,
+        problem_class="mip",
     )
     narration = (
         "With the 13 selected names held fixed, the Tech group cap's conditional "
-        "shadow price is about 11 bps. Minimum-CVaR reached 0.0184 (VaR 0.0152)."
+        "sensitivity magnitude is 0.0011. Minimum-CVaR reached 0.0184 (VaR 0.0152)."
     )
     assert verify(narration, report).ok
+
+
+def test_time_limited_template_names_validated_incumbent_and_relative_gap() -> None:
+    report = SolutionReport(
+        weights={"AAA": 0.60, "BBB": 0.40, "CCC": 0.0},
+        objective_kind="min_cvar",
+        objective_value=0.025,
+        solver="HiGHS",
+        solve_time_ms=250.0,
+        status="user_limit",
+        n_assets=3,
+        nonzero_names=2,
+        duals_conditional=False,
+        selected_names=["AAA", "BBB"],
+        optimality_gap=0.125,
+        termination_reason="time_limit",
+        optimality_proven=False,
+        incumbent_validated=True,
+        sensitivity_note=(
+            "Sensitivities are unavailable for a time-limited incumbent because "
+            "fix-and-resolve could optimize a different portfolio."
+        ),
+        problem_class="mip",
+    )
+
+    text = template_summary(report)
+
+    assert "validated feasible incumbent" in text
+    assert "optimality was not proven" in text
+    assert "relative gap is 0.125000" in text
+    assert report.sensitivity_note in text
+    assert verify(text, report).ok

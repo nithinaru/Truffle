@@ -21,6 +21,7 @@ from core.ir import (
     Box,
     Budget,
     Cardinality,
+    FactorExposure,
     GroupCap,
     LongOnly,
     MinCVaR,
@@ -29,7 +30,7 @@ from core.ir import (
     TransactionCost,
     TurnoverCap,
 )
-from core.solve import _conditional_spec, solve_spec
+from core.solve import _conditional_spec, _coverage, _fix_and_resolve, _ProblemInputs, solve_spec
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
 UNIVERSE = ["AAA", "BBB", "CCC", "DDD", "EEE"]
@@ -60,6 +61,13 @@ def test_miqp_conditional_duals_flagged_and_selected_set(prices: pd.DataFrame) -
     for t in UNIVERSE:
         if t not in report.selected_names:
             assert report.weights[t] == 0.0
+    # Zero-fixing an unselected name creates degenerate LongOnly/Box duals.
+    # Those rows are not relaxation levers with the selection held fixed.
+    unselected = set(UNIVERSE) - set(report.selected_names)
+    assert not any(
+        item.kind in {"long_only", "box"} and item.row_label in unselected
+        for item in report.sensitivities
+    )
     # The fix-and-resolve produced real conditional shadow prices.
     assert report.binding
     assert all(b.shadow_price == b.shadow_price for b in report.binding)  # not NaN
@@ -183,6 +191,98 @@ def test_conditional_spec_preserves_holdings_costs_and_min_position_floor() -> N
     assert zero_fix.tickers == ["B"]
     assert floor.tickers == ["A", "C"]
     assert floor.upper == 1.0
+
+
+def test_conditional_rows_without_selected_name_support_are_unavailable() -> None:
+    spec = PortfolioSpec(
+        universe=["A", "B", "C"],
+        objective=MinVariance(),
+        constraints=[
+            Budget(id="budget"),
+            LongOnly(id="long"),
+            GroupCap(id="group", group="G", min_weight=0.0, max_weight=0.9),
+            FactorExposure(
+                id="factor",
+                factor="value",
+                min_exposure=0.0,
+                max_exposure=1.0,
+            ),
+            Cardinality(id="names", max_names=1),
+        ],
+    )
+    inputs = _ProblemInputs(
+        mu=np.zeros(3),
+        sigma=np.eye(3),
+        scenarios=None,
+        w_prev=np.zeros(3),
+        sectors={"A": "Other", "B": "G", "C": "G"},
+        benchmarks=None,
+        factors={"value": {"A": 0.0, "B": 1.0, "C": -1.0}},
+    )
+
+    conditional = _fix_and_resolve(spec, [0], inputs)
+
+    assert conditional.weights == pytest.approx(np.array([1.0, 0.0, 0.0]), abs=1e-8)
+    assert not {
+        record.constraint_id for record in conditional.sensitivities
+    }.intersection({"group", "factor"})
+    assert "no selected-name coefficient support" in conditional.unavailable_reasons["group"]
+    assert "no selected-name coefficient support" in conditional.unavailable_reasons["factor"]
+    coverage = _coverage(
+        spec,
+        conditional.sensitivities,
+        conditional=bool(conditional.sensitivities),
+        constraint_unavailable_reasons=conditional.unavailable_reasons,
+    )
+    for constraint_id in ("group", "factor"):
+        assert coverage[constraint_id].availability == "unavailable"
+        assert "no selected-name coefficient support" in (
+            coverage[constraint_id].reason or ""
+        )
+
+
+def test_optimal_inaccurate_fix_and_resolve_never_exposes_conditional_duals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = PortfolioSpec(
+        universe=["A", "B"],
+        objective=MinVariance(),
+        constraints=[
+            Budget(id="budget"),
+            LongOnly(id="long"),
+            Cardinality(id="names", max_names=1),
+        ],
+    )
+    inputs = _ProblemInputs(
+        mu=np.zeros(2),
+        sigma=np.eye(2),
+        scenarios=None,
+        w_prev=np.zeros(2),
+        sectors=None,
+        benchmarks=None,
+        factors=None,
+    )
+
+    def inaccurate_solve(
+        problem: cp.Problem,
+        cp_solver: str,
+        name: str,
+        *,
+        time_limit_s: float | None = None,
+    ) -> float:
+        del name, time_limit_s
+        problem.solve(solver=cp_solver)
+        problem._status = "optimal_inaccurate"
+        return 1.0
+
+    monkeypatch.setattr("core.solve._run_solver", inaccurate_solve)
+
+    conditional = _fix_and_resolve(spec, [0], inputs)
+
+    assert conditional.weights is not None
+    assert conditional.sensitivities == ()
+    assert conditional.unavailable_reason is not None
+    assert "exact 'optimal' status" in conditional.unavailable_reason
 
 
 def test_continuous_duals_remain_unconditional(prices: pd.DataFrame) -> None:

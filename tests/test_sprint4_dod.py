@@ -94,7 +94,14 @@ def test_miqp_min_variance_at_most_10_names(prices: pd.DataFrame) -> None:
 
     assert report.solver == "SCIP"  # MIQP backend
     assert report.nonzero_names <= 10
-    assert report.duals_conditional is True
+    assert report.problem_class == "mip"
+    if report.duals_conditional:
+        assert report.sensitivities
+        assert all(item.conditional for item in report.sensitivities)
+    else:
+        assert report.sensitivities == ()
+        assert report.sensitivity_note is not None
+        assert "different portfolio weights" in report.sensitivity_note
     assert report.selected_names is not None and len(report.selected_names) <= 10
     assert verify(template_summary(report), report).ok
 

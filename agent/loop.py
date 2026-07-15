@@ -75,7 +75,7 @@ def _mip_guard(spec: PortfolioSpec) -> tuple[float | None, str | None]:
         warn = (
             f"Note: {n} names is large for a mixed-integer search, so the solver "
             f"is capped at {MIP_TIME_LIMIT_S:g}s; I'll report the optimality gap "
-            "it reaches (0 means proven optimal)."
+            "and the backend-verified termination state it reaches."
         )
         return MIP_TIME_LIMIT_S, warn
     return None, None

@@ -15,6 +15,8 @@ from core.exceptions import (
 )
 from core.ir import PortfolioSpec
 from core.report import ConflictReport, SolutionReport
+from core.report_semantics import ObjectiveDecomposition, ObjectiveTerm, PortfolioMetric
+from core.sensitivity import SensitivityCoverage, SensitivityRecord
 from truffle.api import SpecInput, run_walk_forward_backtest, solve_portfolio
 
 __all__ = [
@@ -24,7 +26,12 @@ __all__ = [
     "ConflictReport",
     "DiagnosisError",
     "InfeasibleError",
+    "ObjectiveDecomposition",
+    "ObjectiveTerm",
     "PortfolioSpec",
+    "PortfolioMetric",
+    "SensitivityCoverage",
+    "SensitivityRecord",
     "SolutionReport",
     "SolverError",
     "SpecInput",
