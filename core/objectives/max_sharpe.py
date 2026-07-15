@@ -16,7 +16,9 @@ Scope and precondition (documented for the sprint):
 * Transforming *arbitrary* user constraints through this change of variables is
   subtle, so this sprint supports MaxSharpe with **budget + long-only + box
   only**. Any other constraint raises a clear "unsupported with max_sharpe"
-  error. Long-only is *required* (it is what makes ``y ≥ 0`` valid).
+  error. Long-only is *required* (it is what makes ``y ≥ 0`` valid). An omitted
+  budget means the documented implicit unit budget; an explicit budget must
+  have ``total=1.0`` because recovery always normalizes weights to one.
 * Precondition: a positive-excess-return portfolio must exist. If every
   excess return is ≤ 0 the transform is infeasible (no portfolio beats the
   risk-free rate) and we raise immediately with that explanation.
@@ -34,7 +36,14 @@ import cvxpy as cp
 import numpy as np
 from pydantic import Field
 
-from core.compile_context import CompiledProblem, validate_inputs
+from core.compile_context import (
+    CompiledProblem,
+    normalized_weights,
+    validate_full_quadratic_coefficients,
+    validate_inputs,
+    validate_unit_budget,
+    validated_array_result,
+)
 from core.exceptions import CompilationError
 from core.irbase import ProblemClassImpact, _IRModel
 
@@ -49,13 +58,17 @@ class MaxSharpe(_IRModel):
 
     kind: Literal["max_sharpe"] = "max_sharpe"
     risk_free_rate: float = Field(
-        default=0.0, description="Annualized risk-free rate r_f subtracted from μ to form excess returns."
+        default=0.0,
+        description="Annualized risk-free rate r_f subtracted from μ to form excess returns.",
     )
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
 
 
-def build(node: MaxSharpe, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> CompiledProblem:
-    validate_inputs(spec, mu, sigma)
+def build(
+    node: MaxSharpe, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray
+) -> CompiledProblem:
+    mu, sigma = validate_inputs(spec, mu, sigma)
+    validate_full_quadratic_coefficients(sigma)
     n = len(spec.universe)
 
     kinds = {c.kind for c in spec.constraints}
@@ -70,8 +83,12 @@ def build(node: MaxSharpe, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarra
             "max_sharpe requires a long_only constraint in this sprint (the "
             "Charnes–Cooper y ≥ 0 transform assumes a long-only book)."
         )
+    validate_unit_budget(spec, objective_name="max_sharpe")
 
-    mu_excess = np.asarray(mu, dtype=float) - node.risk_free_rate
+    mu_excess = validated_array_result(
+        lambda: mu - node.risk_free_rate,
+        label="max_sharpe excess-return vector",
+    )
     if float(np.max(mu_excess)) <= 0.0:
         raise CompilationError(
             "max_sharpe is infeasible: no asset has positive excess return over "
@@ -108,8 +125,7 @@ def build(node: MaxSharpe, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarra
     problem = cp.Problem(objective, hard)
 
     def _recover() -> np.ndarray:
-        raw = np.asarray(y.value, dtype=float)
-        return raw / float(np.sum(raw))
+        return normalized_weights(y.value, objective_name="max_sharpe")
 
     return CompiledProblem(
         problem=problem,

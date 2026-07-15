@@ -22,6 +22,7 @@ node only contributes a penalty (TransactionCost).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -33,6 +34,94 @@ from core.exceptions import CompilationError
 
 if TYPE_CHECKING:
     from core.ir import PortfolioSpec
+
+
+_COVARIANCE_SYMMETRY_REL_TOL = 1e-8
+_COVARIANCE_PSD_REL_TOL = 1e-10
+
+
+def _as_finite_array(value: object, *, label: str) -> np.ndarray:
+    """Coerce ``value`` to a real float array and reject invalid numeric data."""
+    try:
+        raw = np.asarray(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CompilationError(f"{label} must be a numeric array.") from exc
+    if np.iscomplexobj(raw):
+        raise CompilationError(f"{label} must contain only real values.")
+    try:
+        # Own the returned memory. CVXPY constants may otherwise retain a view
+        # into a caller's array and become invalid if that array is mutated
+        # after compilation.
+        array = np.array(raw, dtype=float, copy=True)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CompilationError(f"{label} must be a numeric array.") from exc
+    if not np.all(np.isfinite(array)):
+        raise CompilationError(f"{label} must contain only finite values.")
+    return array
+
+
+def validated_array_result(operation: Callable[[], object], *, label: str) -> np.ndarray:
+    """Run numeric arithmetic and reject a non-finite derived result.
+
+    Inputs can each be finite while their sum, difference, product, or matrix
+    product overflows. Derived coefficients receive the same trust-boundary
+    treatment as caller-supplied arrays before they are handed to CVXPY.
+    """
+    try:
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            result = operation()
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise CompilationError(f"{label} could not be computed safely.") from exc
+    return _as_finite_array(result, label=label)
+
+
+def validate_vector(value: object, n: int, *, label: str) -> np.ndarray:
+    """Return a finite real vector aligned to a universe of size ``n``."""
+    vector = _as_finite_array(value, label=label)
+    if vector.shape != (n,):
+        raise CompilationError(f"{label} shape {vector.shape} does not match universe size ({n},).")
+    return vector
+
+
+def validate_full_quadratic_coefficients(sigma: np.ndarray) -> None:
+    """Ensure CVXPY can represent a full ``quad_form`` objective's ``2Σ``."""
+    validated_array_result(
+        lambda: 2.0 * sigma,
+        label="Quadratic covariance coefficients",
+    )
+
+
+def normalized_weights(raw: object, *, objective_name: str) -> np.ndarray:
+    """Recover finite unit-sum weights without overflowing ``sum(raw)``."""
+    values = _as_finite_array(raw, label=f"{objective_name} transformed weights")
+    if values.ndim != 1 or values.size == 0:
+        raise CompilationError(
+            f"{objective_name} weight recovery requires a non-empty vector; "
+            f"got shape {values.shape}."
+        )
+    scale = float(np.max(np.abs(values)))
+    if scale <= 0.0:
+        raise CompilationError(
+            f"{objective_name} weight recovery requires a positive transformed total."
+        )
+    scaled = values / scale
+    total = math.fsum(float(value) for value in scaled)
+    if not math.isfinite(total) or total <= 0.0:
+        raise CompilationError(
+            f"{objective_name} weight recovery requires a positive transformed total."
+        )
+    weights = _as_finite_array(
+        scaled / total,
+        label=f"{objective_name} recovered weights",
+    )
+    recovered_total = math.fsum(float(value) for value in weights)
+    if not math.isfinite(recovered_total) or not math.isclose(
+        recovered_total, 1.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise CompilationError(
+            f"{objective_name} recovered weights do not satisfy the unit budget."
+        )
+    return weights
 
 
 @dataclass(slots=True)
@@ -75,20 +164,83 @@ class CompiledProblem:
         return np.asarray(self.weights.value, dtype=float)
 
 
-def validate_inputs(spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> None:
-    """Shape/symmetry checks shared by every compile path."""
+def validate_inputs(
+    spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite, aligned inputs with covariance canonicalized to PSD.
+
+    A materially asymmetric or indefinite covariance is rejected. Tiny
+    eigensolver-scale negative eigenvalues are treated as numerical roundoff
+    and projected to zero before the matrix reaches ``cp.psd_wrap``.
+    """
     n = len(spec.universe)
+    sigma = _as_finite_array(sigma, label="Covariance matrix")
+    mu = _as_finite_array(mu, label="Expected-return vector")
     if sigma.shape != (n, n):
         raise CompilationError(f"Covariance shape {sigma.shape} does not match universe size {n}.")
     if mu.shape != (n,):
         raise CompilationError(
             f"Expected-return vector shape {mu.shape} does not match universe size ({n},)."
         )
-    # Symmetrize sigma defensively — CVXPY's `quad_form` insists on PSD, and
-    # off-by-eps asymmetry from floating point is a common compile-time surprise.
-    asym = float(np.max(np.abs(sigma - sigma.T))) if sigma.size else 0.0
-    if asym > 1e-8:
-        raise CompilationError(f"Covariance matrix is not symmetric (max |Σ − Σᵀ| = {asym:.2e}).")
+    # Use a scale-relative symmetry tolerance. The difference may itself
+    # overflow for extreme opposite-signed entries; that is necessarily beyond
+    # tolerance and is treated as infinite asymmetry.
+    with np.errstate(over="ignore", invalid="ignore"):
+        symmetry_delta = sigma - sigma.T
+    asym = float(np.max(np.abs(symmetry_delta))) if sigma.size else 0.0
+    entry_scale = float(np.max(np.abs(sigma))) if sigma.size else 0.0
+    symmetry_tolerance = _COVARIANCE_SYMMETRY_REL_TOL * entry_scale
+    if not math.isfinite(asym) or asym > symmetry_tolerance:
+        raise CompilationError(
+            "Covariance matrix is not symmetric "
+            f"(max |Σ − Σᵀ| = {asym:.2e}, tolerance = {symmetry_tolerance:.2e})."
+        )
+    # Divide before adding so two same-sign finite entries near float max do not
+    # overflow merely while being averaged.
+    sigma = validated_array_result(
+        lambda: 0.5 * sigma + 0.5 * sigma.T,
+        label="Symmetrized covariance matrix",
+    )
+
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(sigma)
+    except np.linalg.LinAlgError as exc:
+        raise CompilationError("Covariance matrix PSD check did not converge.") from exc
+    if not np.all(np.isfinite(eigenvalues)) or not np.all(np.isfinite(eigenvectors)):
+        raise CompilationError("Covariance matrix PSD check produced non-finite values.")
+
+    spectral_scale = float(np.max(np.abs(eigenvalues))) if eigenvalues.size else 0.0
+    psd_tolerance = _COVARIANCE_PSD_REL_TOL * spectral_scale
+    min_eigenvalue = float(eigenvalues[0]) if eigenvalues.size else 0.0
+    if min_eigenvalue < -psd_tolerance:
+        raise CompilationError(
+            "Covariance matrix is not positive semidefinite "
+            f"(minimum eigenvalue = {min_eigenvalue:.2e}, tolerance = {psd_tolerance:.2e})."
+        )
+    if min_eigenvalue < 0.0:
+        clipped = np.clip(eigenvalues, 0.0, None)
+        sigma = validated_array_result(
+            lambda: (eigenvectors * clipped) @ eigenvectors.T,
+            label="PSD-projected covariance matrix",
+        )
+        sigma = validated_array_result(
+            lambda: 0.5 * sigma + 0.5 * sigma.T,
+            label="PSD-projected covariance matrix",
+        )
+    return mu, sigma
+
+
+def validate_positive_definite_covariance(sigma: np.ndarray, *, objective_name: str) -> None:
+    """Require numerically positive-definite risk for a coercive transform."""
+    eigenvalues = np.linalg.eigvalsh(sigma)
+    spectral_scale = float(np.max(np.abs(eigenvalues))) if eigenvalues.size else 0.0
+    tolerance = _COVARIANCE_PSD_REL_TOL * spectral_scale
+    min_eigenvalue = float(eigenvalues[0]) if eigenvalues.size else 0.0
+    if spectral_scale == 0.0 or min_eigenvalue <= tolerance:
+        raise CompilationError(
+            f"{objective_name} requires a positive-definite covariance matrix "
+            f"(minimum eigenvalue = {min_eigenvalue:.2e}, tolerance = {tolerance:.2e})."
+        )
 
 
 def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:
@@ -101,12 +253,7 @@ def resolve_w_prev(w_prev: np.ndarray | None, n: int) -> np.ndarray:
     """
     if w_prev is None:
         return np.zeros(n, dtype=float)
-    w_prev = np.asarray(w_prev, dtype=float)
-    if w_prev.shape != (n,):
-        raise CompilationError(
-            f"w_prev vector shape {w_prev.shape} does not match universe size ({n},)."
-        )
-    return w_prev
+    return validate_vector(w_prev, n, label="w_prev vector")
 
 
 def validate_scenarios(scenarios: np.ndarray | None, n: int) -> np.ndarray:
@@ -120,12 +267,45 @@ def validate_scenarios(scenarios: np.ndarray | None, n: int) -> np.ndarray:
             "min_cvar objective requires a scenario matrix; got scenarios=None. "
             "Pass scenarios from data.scenarios.historical_scenarios(prices) (or another generator)."
         )
-    scenarios = np.asarray(scenarios, dtype=float)
+    scenarios = _as_finite_array(scenarios, label="Scenario matrix")
     if scenarios.ndim != 2 or scenarios.shape[1] != n:
         raise CompilationError(f"Scenario matrix must have shape (S, {n}); got {scenarios.shape}.")
     if scenarios.shape[0] < 1:
         raise CompilationError("Scenario matrix must have at least one scenario row.")
     return scenarios
+
+
+def validate_named_vectors(
+    named: dict[str, np.ndarray] | None,
+    n: int,
+    *,
+    label: str,
+) -> dict[str, np.ndarray] | None:
+    """Return all supplied named vectors as finite universe-aligned arrays."""
+    if named is None:
+        return None
+    validated: dict[str, np.ndarray] = {}
+    for name, values in named.items():
+        vector_label = f"{label} {name!r} vector"
+        validated[name] = validate_vector(values, n, label=vector_label)
+    return validated
+
+
+def validate_unit_budget(spec: PortfolioSpec, *, objective_name: str) -> None:
+    """Reject explicit budgets that a unit-normalizing transform cannot honor.
+
+    No explicit Budget remains valid and means the transform's documented
+    implicit fully-invested budget. If Budget nodes are present, every one must
+    confirm that same unit total.
+    """
+    for constraint in spec.constraints:
+        if constraint.kind == "budget" and not math.isclose(
+            constraint.total, 1.0, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise CompilationError(
+                f"{objective_name} currently supports only Budget(total=1.0); "
+                f"received total={constraint.total:g}."
+            )
 
 
 def build_cvar_block(
@@ -217,7 +397,7 @@ class BuildContext:
                 f"Benchmark {name!r} weights were not supplied. Pass --benchmark "
                 "(CLI) or benchmark_weights to compile_spec."
             )
-        b = np.asarray(self.benchmark_weights[name], dtype=float)
+        b = _as_finite_array(self.benchmark_weights[name], label=f"Benchmark {name!r} vector")
         if b.shape != (self.n,):
             raise CompilationError(
                 f"Benchmark {name!r} vector shape {b.shape} does not match "
@@ -232,7 +412,7 @@ class BuildContext:
                 f"Factor {name!r} loadings were not supplied. Pass --factors "
                 "(CLI) or factor_loadings to compile_spec."
             )
-        loadings = np.asarray(self.factor_loadings[name], dtype=float)
+        loadings = _as_finite_array(self.factor_loadings[name], label=f"Factor {name!r} loadings")
         if loadings.shape != (self.n,):
             raise CompilationError(
                 f"Factor {name!r} loadings shape {loadings.shape} does not match "

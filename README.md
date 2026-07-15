@@ -54,6 +54,7 @@ truffle backtest examples/spec_minvar.yaml \
 - Objectives: minimum-variance, mean-variance, max-Sharpe, **minimum-CVaR** (Rockafellar–Uryasev), risk parity, min-tracking-error
 - Constraints: budget, long-only, position bounds, sector/group caps, cardinality, turnover, transaction costs, factor exposures, CVaR limits, tracking-error caps
 - Proper covariance estimation (Ledoit–Wolf shrinkage) and historical CVaR scenarios
+- A fail-closed numerical boundary for finite IR/data inputs and symmetric PSD covariance
 - Seeded IID and contiguous-block bootstrap scenario APIs, with explicit horizon units
 - Shadow-price explanations grounded in real solver duals — every number is verified against solver output
 - Opt-in infeasibility diagnosis via normalized elastic relaxation and deletion filtering
@@ -385,8 +386,8 @@ explicit live run are still required before publishing one.
   bid/ask, adverse slippage, commissions, minimum fees, quantity steps, and
   conservative tick rounding, but not partial fills, exchange queues, market
   impact, or broker-specific behavior.
-- **Max-Sharpe** uses the Charnes–Cooper transform and currently supports only `budget` + `long_only` + `box` constraints (and requires `long_only`). Combining it with group caps, turnover, transaction cost, tracking error, CVaR or factor constraints raises a clear error; use a min-variance / mean-variance / min-CVaR objective if you need those together. Transforming arbitrary constraints through the change of variables is future work.
-- **Risk parity** is solved standalone (the convex log-barrier surrogate, normalized); it does not yet compose with additional hard constraints.
+- **Max-Sharpe** uses the Charnes–Cooper transform and currently supports only `budget` + `long_only` + `box` constraints (and requires `long_only`). Its recovered portfolio is fully invested: no explicit budget means an implicit unit budget, while an explicit budget must use `total=1.0`. Combining it with group caps, turnover, transaction cost, tracking error, CVaR or factor constraints raises a clear error; use a min-variance / mean-variance / min-CVaR objective if you need those together. Transforming arbitrary constraints through the change of variables is future work.
+- **Risk parity** is solved standalone (the convex log-barrier surrogate, normalized) and does not yet compose with additional hard constraints. It requires a numerically positive-definite covariance, has an implicit unit budget, and rejects an explicit budget whose total is not `1.0`.
 
 ## Disclaimer
 

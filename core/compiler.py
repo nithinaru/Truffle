@@ -34,14 +34,19 @@ from collections.abc import Callable
 
 import cvxpy as cp
 import numpy as np
+from pydantic import ValidationError
 
 from core.compile_context import (
     BuildContext,
     CompiledProblem,
     build_cvar_block,
     resolve_w_prev,
+    validate_full_quadratic_coefficients,
     validate_inputs,
+    validate_named_vectors,
     validate_scenarios,
+    validate_vector,
+    validated_array_result,
 )
 from core.constraints import (
     cardinality,
@@ -154,6 +159,7 @@ def _build_quad_objective_expr(
     spec: PortfolioSpec, w: cp.Variable, mu: np.ndarray, sigma: np.ndarray
 ) -> cp.Expression:
     obj = spec.objective
+    validate_full_quadratic_coefficients(sigma)
     # `cp.psd_wrap` tells CVXPY to trust the matrix as PSD; the Ledoit–Wolf
     # estimator we use guarantees this, but a sample Σ on a tiny window can
     # be numerically indefinite, so wrapping is the safe contract.
@@ -161,7 +167,11 @@ def _build_quad_objective_expr(
     if isinstance(obj, MinVariance):
         return quad
     if isinstance(obj, MeanVariance):
-        return quad - obj.risk_aversion * (mu @ w)
+        scaled_mu = validated_array_result(
+            lambda: obj.risk_aversion * mu,
+            label="Mean-variance scaled expected-return vector",
+        )
+        return quad - scaled_mu @ w
     raise CompilationError(
         f"_build_quad_objective_expr called on non-quadratic: {type(obj).__name__}"
     )
@@ -252,13 +262,54 @@ def compile_spec(
         auxiliary variables (``t`` and ``z`` for CVaR).
 
     Raises:
-        CompilationError: if shapes mismatch, Σ is not symmetric, scenarios
-            are missing/malformed for CVaR, or the IR contains an
-            objective/constraint kind the compiler does not understand.
+        CompilationError: if numerical inputs are non-finite, shapes mismatch,
+            Σ is not symmetric/PSD within tolerance, scenarios are
+            missing/malformed for CVaR, or the IR contains an objective or
+            constraint kind the compiler does not understand.
     """
-    validate_inputs(spec, mu, sigma)
+    # Pydantic models are mutable and their list/dict fields can be modified in
+    # place after construction. Rebuild from the complete payload so mutated or
+    # unsafely constructed IR cannot bypass field and cross-model validators.
+    try:
+        spec = PortfolioSpec.model_validate(spec.model_dump(mode="python"))
+    except ValidationError as exc:
+        raise CompilationError(f"PortfolioSpec is invalid at compilation: {exc}") from exc
+
+    mu, sigma = validate_inputs(spec, mu, sigma)
+    n = len(spec.universe)
+    # Validate every supplied numeric input, including optional data that the
+    # current spec does not reference. Bad state should never sit latent in a
+    # compiled request and become active after an amendment.
+    if scenarios is not None:
+        scenarios = validate_scenarios(scenarios, n)
+    w_prev_vec = resolve_w_prev(w_prev, n)
+    benchmark_weights = validate_named_vectors(benchmark_weights, n, label="Benchmark")
+    factor_loadings = validate_named_vectors(factor_loadings, n, label="Factor")
+
+    if _cardinality_weight_bounds is None:
+        cardinality_lower = np.zeros(n, dtype=float)
+        cardinality_upper = None
+    else:
+        cardinality_lower = validate_vector(
+            _cardinality_weight_bounds[0],
+            n,
+            label="Cardinality diagnostic lower bounds",
+        )
+        cardinality_upper = validate_vector(
+            _cardinality_weight_bounds[1],
+            n,
+            label="Cardinality diagnostic upper bounds",
+        )
+        if np.any(cardinality_lower > cardinality_upper):
+            raise CompilationError(
+                "Cardinality diagnostic lower bounds must not exceed upper bounds."
+            )
+
     if _validate_cardinality_preconditions and _cardinality_weight_bounds is None:
         _validate_cardinality_domain(spec)
+
+    if isinstance(spec.objective, MinVariance | MeanVariance | MinTrackingError):
+        validate_full_quadratic_coefficients(sigma)
 
     # Change-of-variable objectives build their own transformed problem (they do
     # not optimize over w directly) and return early with a weight-recovery hook.
@@ -267,28 +318,8 @@ def compile_spec(
     if isinstance(spec.objective, RiskParity):
         return risk_parity.build(spec.objective, spec, mu, sigma)
 
-    n = len(spec.universe)
     w = cp.Variable(n, name="w")
     ticker_index = {t: i for i, t in enumerate(spec.universe)}
-    # Resolved once so every constraint builder sees the same pre-trade vector.
-    w_prev_vec = resolve_w_prev(w_prev, n)
-
-    if _cardinality_weight_bounds is None:
-        cardinality_lower = np.zeros(n, dtype=float)
-        cardinality_upper = None
-    else:
-        cardinality_lower = np.asarray(_cardinality_weight_bounds[0], dtype=float)
-        cardinality_upper = np.asarray(_cardinality_weight_bounds[1], dtype=float)
-        if (
-            cardinality_lower.shape != (n,)
-            or cardinality_upper.shape != (n,)
-            or not np.all(np.isfinite(cardinality_lower))
-            or not np.all(np.isfinite(cardinality_upper))
-            or np.any(cardinality_lower > cardinality_upper)
-        ):
-            raise CompilationError(
-                "Cardinality diagnostic bounds must be finite aligned lower/upper vectors."
-            )
 
     ctx = BuildContext(
         w=w,

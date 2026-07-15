@@ -25,7 +25,15 @@ def _new_id(prefix: str) -> str:
 
 
 class _IRModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=False)
+    # Numeric intent must be finite before it can become part of a confirmed
+    # specification. This applies recursively to typed containers such as
+    # PortfolioSpec.current_weights as well as to scalar objective/constraint
+    # fields.
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=False,
+        allow_inf_nan=False,
+    )
 
 
 class _ConstraintIRModel(_IRModel):

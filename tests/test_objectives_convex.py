@@ -21,6 +21,7 @@ from core.ir import (
     LongOnly,
     MaxSharpe,
     MinTrackingError,
+    MinVariance,
     PortfolioSpec,
     RiskParity,
 )
@@ -57,8 +58,6 @@ def test_max_sharpe_recovers_fully_invested_weights() -> None:
 
 def test_max_sharpe_beats_minvariance_sharpe() -> None:
     """The max-Sharpe portfolio must have Sharpe >= the min-variance portfolio's."""
-    from core.ir import MinVariance
-
     sharpe_spec = PortfolioSpec(
         universe=_UNIVERSE, objective=MaxSharpe(), constraints=[Budget(), LongOnly()]
     )
@@ -112,6 +111,27 @@ def test_max_sharpe_precondition_no_excess_return() -> None:
         compile_spec(spec, mu=_MU, sigma=_SIGMA)
 
 
+@pytest.mark.parametrize("total", [0.0, 0.5, 2.0, -1.0])
+def test_max_sharpe_rejects_explicit_nonunit_budget(total: float) -> None:
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=MaxSharpe(),
+        constraints=[Budget(total=total), LongOnly()],
+    )
+    with pytest.raises(CompilationError, match=r"supports only Budget\(total=1\.0\)"):
+        compile_spec(spec, mu=_MU, sigma=_SIGMA)
+
+
+def test_max_sharpe_keeps_documented_implicit_unit_budget() -> None:
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=MaxSharpe(),
+        constraints=[LongOnly()],
+    )
+    weights = _solve(spec).recovered_weights()
+    np.testing.assert_allclose(np.sum(weights), 1.0, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # RiskParity
 # ---------------------------------------------------------------------------
@@ -119,9 +139,7 @@ def test_max_sharpe_precondition_no_excess_return() -> None:
 
 def test_risk_parity_equalizes_risk_contributions() -> None:
     # Use a non-diagonal but well-conditioned covariance.
-    sigma = np.array(
-        [[0.04, 0.006, 0.0], [0.006, 0.09, 0.01], [0.0, 0.01, 0.16]]
-    )
+    sigma = np.array([[0.04, 0.006, 0.0], [0.006, 0.09, 0.01], [0.0, 0.01, 0.16]])
     spec = PortfolioSpec(
         universe=_UNIVERSE, objective=RiskParity(), constraints=[Budget(), LongOnly()]
     )
@@ -143,6 +161,89 @@ def test_risk_parity_rejects_unsupported_constraint() -> None:
     )
     with pytest.raises(CompilationError, match="unsupported with risk_parity"):
         compile_spec(spec, mu=_MU, sigma=_SIGMA)
+
+
+@pytest.mark.parametrize("total", [0.0, 0.5, 2.0, -1.0])
+def test_risk_parity_rejects_explicit_nonunit_budget(total: float) -> None:
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=RiskParity(),
+        constraints=[Budget(total=total)],
+    )
+    with pytest.raises(CompilationError, match=r"supports only Budget\(total=1\.0\)"):
+        compile_spec(spec, mu=_MU, sigma=_SIGMA)
+
+
+def test_risk_parity_keeps_documented_implicit_unit_budget_and_positivity() -> None:
+    spec = PortfolioSpec(universe=_UNIVERSE, objective=RiskParity(), constraints=[])
+    weights = _solve(spec).recovered_weights()
+    np.testing.assert_allclose(np.sum(weights), 1.0, atol=1e-6)
+    assert np.all(weights > 0.0)
+
+
+@pytest.mark.parametrize("objective", [MaxSharpe(), RiskParity()])
+def test_transformed_objective_checks_every_explicit_budget(objective: object) -> None:
+    constraints = [Budget(total=1.0), Budget(total=0.5)]
+    if isinstance(objective, MaxSharpe):
+        constraints.append(LongOnly())
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=objective,
+        constraints=constraints,
+    )
+    with pytest.raises(CompilationError, match=r"supports only Budget\(total=1\.0\)"):
+        compile_spec(spec, mu=_MU, sigma=_SIGMA)
+
+
+@pytest.mark.parametrize(
+    ("objective", "constraints"),
+    [
+        (MaxSharpe(), [LongOnly()]),
+        (RiskParity(), []),
+    ],
+)
+def test_transformed_weight_recovery_is_scale_safe(
+    objective: object, constraints: list[object]
+) -> None:
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=objective,
+        constraints=constraints,
+    )
+    compiled = compile_spec(spec, mu=_MU, sigma=_SIGMA)
+    compiled.weights.value = np.full(3, 1e308)
+    np.testing.assert_allclose(compiled.recovered_weights(), np.full(3, 1.0 / 3.0))
+
+
+@pytest.mark.parametrize(
+    ("objective", "constraints"),
+    [
+        (MaxSharpe(), [LongOnly()]),
+        (RiskParity(), []),
+    ],
+)
+def test_transformed_weight_recovery_rejects_nonpositive_total(
+    objective: object, constraints: list[object]
+) -> None:
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=objective,
+        constraints=constraints,
+    )
+    compiled = compile_spec(spec, mu=_MU, sigma=_SIGMA)
+    compiled.weights.value = np.zeros(3)
+    with pytest.raises(CompilationError, match="requires a positive transformed total"):
+        compiled.recovered_weights()
+
+
+def test_regular_objective_preserves_finite_nonunit_budget_semantics() -> None:
+    spec = PortfolioSpec(
+        universe=_UNIVERSE,
+        objective=MinVariance(),
+        constraints=[Budget(total=0.5), LongOnly()],
+    )
+    compiled = _solve(spec)
+    np.testing.assert_allclose(np.sum(compiled.recovered_weights()), 0.5, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

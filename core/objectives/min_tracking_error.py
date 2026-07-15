@@ -13,7 +13,7 @@ from typing import ClassVar, Literal
 import cvxpy as cp
 from pydantic import Field
 
-from core.compile_context import BuildContext
+from core.compile_context import BuildContext, validate_full_quadratic_coefficients
 from core.irbase import ProblemClassImpact, _IRModel
 
 
@@ -28,5 +28,6 @@ class MinTrackingError(_IRModel):
 def build(node: MinTrackingError, ctx: BuildContext) -> cp.Expression:
     """Return the base objective expression ``(w − b)ᵀ Σ (w − b)``."""
     b = ctx.aligned_benchmark(node.benchmark)
+    validate_full_quadratic_coefficients(ctx.sigma)
     active = ctx.w - b
     return cp.quad_form(active, cp.psd_wrap(ctx.sigma))

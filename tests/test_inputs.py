@@ -46,8 +46,25 @@ def test_align_named_none_passthrough() -> None:
     assert align_named(None, ["A"], label="Factor") is None
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_align_named_rejects_nonfinite_values_with_series_and_ticker_context(
+    bad_value: float,
+) -> None:
+    named = {"bench": {"A": bad_value}}
+    with pytest.raises(ValueError, match="Benchmark 'bench'.*ticker 'A'.*finite"):
+        align_named(named, ["A"], label="Benchmark")
+
+
 def test_load_named_series_requires_ticker_first_column(tmp_path: Path) -> None:
     bad = tmp_path / "bad.csv"
     bad.write_text("name,bench\nAAA,0.5\n")
     with pytest.raises(ValueError, match="'ticker' as its first column"):
+        load_named_series(bad, label="Benchmark")
+
+
+@pytest.mark.parametrize("raw_value", ["NaN", "inf", "-inf"])
+def test_load_named_series_rejects_nonfinite_values(tmp_path: Path, raw_value: str) -> None:
+    bad = tmp_path / "bad.csv"
+    bad.write_text(f"ticker,bench\nAAA,{raw_value}\n")
+    with pytest.raises(ValueError, match="Benchmark 'bench'.*ticker 'AAA'.*finite"):
         load_named_series(bad, label="Benchmark")

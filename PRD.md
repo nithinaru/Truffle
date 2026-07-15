@@ -1,9 +1,11 @@
 # Truffle Product Requirements
 
 **Status:** Active  
-**Version:** 1.0  
-**Last updated:** 2026-07-15  
+**Version:** 1.1
+**Last updated:** 2026-07-15
 **Primary branch:** `main`
+**Current checkpoint:** Sprint 1 is complete locally and awaits the owner's push
+and remote CI confirmation.
 
 This document is the source of truth for Truffle's remaining product work. The
 original [project blueprint](BLUEPRINT.md) remains useful design history; this
@@ -219,8 +221,6 @@ performance/drawdown review pass.
 
 ### Known blockers
 
-- Numerical validation is incomplete at the IR/compiler boundary.
-- Max-Sharpe and risk parity do not enforce non-unit budget semantics.
 - Objective and shadow-price reporting need typed decomposition and units.
 - Time-limited MIP incumbent handling does not match the advertised behavior.
 - Clarification context and some patch semantics are incomplete.
@@ -248,6 +248,9 @@ sprint may weaken an earlier safety gate.
 with the CI extras and with optional SCIP absent; the next push is ready to
 confirm the GitHub-hosted run.
 
+**Status:** Complete. The owner-pushed commit passed the GitHub-hosted CI run on
+2026-07-15.
+
 ### Sprint 1 - Numerical trust boundary
 
 - Reject NaN and infinity across the typed IR.
@@ -258,6 +261,23 @@ confirm the GitHub-hosted run.
 
 **Exit:** invalid numerical state cannot reach CVXPY, and transformed objectives
 cannot return weights inconsistent with the confirmed budget.
+
+**Status:** Local acceptance complete on 2026-07-15; owner push and remote CI are
+pending. The implementation now:
+
+- rejects NaN and infinity at typed-IR construction and revalidates the complete
+  specification at compilation;
+- coerces and validates all compiler arrays and supplied named vectors before
+  CVXPY construction;
+- uses scale-relative covariance symmetry and PSD tolerances, projecting only
+  accepted roundoff to a numerically PSD matrix;
+- preserves the documented implicit unit budget for Max-Sharpe and risk parity
+  while rejecting every explicit non-unit budget; and
+- covers the trust boundary with direct and parameterized regression tests.
+
+Local evidence: all 554 tests pass under Python 3.12 with the `mip` extra and
+SCIP, and repository-wide Ruff lint passes. Remote CI remains the sprint-closing
+gate.
 
 ### Sprint 2 - Solver and report semantics
 

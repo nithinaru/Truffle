@@ -12,8 +12,12 @@ yields the fully-invested equal-risk-contribution portfolio. The log term also
 keeps every weight strictly positive, so long-only is automatic.
 
 Scope (this sprint): risk_parity is solved as a standalone problem. Only
-budget / long_only (both redundant here and ignored) are accepted; any other
-constraint raises "unsupported with risk_parity".
+budget / long_only are accepted; any other constraint raises "unsupported with
+risk_parity". Long-only is redundant because of the log domain. An omitted
+budget means the documented implicit unit budget; an explicit budget must have
+``total=1.0`` because recovery always normalizes weights to one. The covariance
+must be numerically positive definite: a positive null direction would make the
+unconstrained log-barrier surrogate unbounded before normalization.
 """
 
 from __future__ import annotations
@@ -23,7 +27,13 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 import cvxpy as cp
 import numpy as np
 
-from core.compile_context import CompiledProblem, validate_inputs
+from core.compile_context import (
+    CompiledProblem,
+    normalized_weights,
+    validate_inputs,
+    validate_positive_definite_covariance,
+    validate_unit_budget,
+)
 from core.exceptions import CompilationError
 from core.irbase import ProblemClassImpact, _IRModel
 
@@ -40,8 +50,11 @@ class RiskParity(_IRModel):
     problem_class_impact: ClassVar[ProblemClassImpact] = "convex"
 
 
-def build(node: RiskParity, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray) -> CompiledProblem:
-    validate_inputs(spec, mu, sigma)
+def build(
+    node: RiskParity, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarray
+) -> CompiledProblem:
+    mu, sigma = validate_inputs(spec, mu, sigma)
+    validate_positive_definite_covariance(sigma, objective_name="risk_parity")
     n = len(spec.universe)
 
     kinds = {c.kind for c in spec.constraints}
@@ -51,6 +64,7 @@ def build(node: RiskParity, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarr
             "risk_parity is solved standalone this sprint and accepts only "
             f"budget / long_only; unsupported with risk_parity: {sorted(unsupported)}."
         )
+    validate_unit_budget(spec, objective_name="risk_parity")
 
     w = cp.Variable(n, name="w_rp")
     risk = 0.5 * cp.quad_form(w, cp.psd_wrap(sigma))
@@ -61,8 +75,7 @@ def build(node: RiskParity, spec: PortfolioSpec, mu: np.ndarray, sigma: np.ndarr
     problem = cp.Problem(objective, [])
 
     def _recover() -> np.ndarray:
-        raw = np.asarray(w.value, dtype=float)
-        return raw / float(np.sum(raw))
+        return normalized_weights(w.value, objective_name="risk_parity")
 
     return CompiledProblem(
         problem=problem,

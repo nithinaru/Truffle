@@ -38,7 +38,7 @@ def load_sectors(path: Path) -> dict[str, str]:
 
 
 def load_named_series(path: Path, *, label: str) -> dict[str, dict[str, float]]:
-    """Load a wide ``ticker,<name1>,<name2>,...`` CSV into ``{name -> {ticker -> value}}``."""
+    """Load a wide named-series CSV, rejecting non-numeric or non-finite values."""
     df = pd.read_csv(path)
     if df.columns.empty or df.columns[0] != "ticker":
         raise ValueError(f"{label} CSV must have 'ticker' as its first column.")
@@ -47,9 +47,21 @@ def load_named_series(path: Path, *, label: str) -> dict[str, dict[str, float]]:
         raise ValueError(f"{label} CSV must have at least one named column after 'ticker'.")
     out: dict[str, dict[str, float]] = {}
     for name in names:
-        out[str(name)] = {
-            str(t): float(v) for t, v in zip(df["ticker"], df[name], strict=True)
-        }
+        series: dict[str, float] = {}
+        for ticker, raw_value in zip(df["ticker"], df[name], strict=True):
+            ticker = str(ticker)
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"{label} {str(name)!r} value for ticker {ticker!r} must be numeric and finite."
+                ) from exc
+            if not np.isfinite(value):
+                raise ValueError(
+                    f"{label} {str(name)!r} value for ticker {ticker!r} must be finite."
+                )
+            series[ticker] = value
+        out[str(name)] = series
     return out
 
 
@@ -61,10 +73,11 @@ def align_named(
 ) -> dict[str, np.ndarray] | None:
     """Align ``{name -> {ticker -> value}}`` to universe-ordered arrays.
 
-    Validates that every universe ticker is present in each named series; raises
-    ``ValueError`` listing the missing tickers otherwise. Extra tickers beyond
-    the universe are ignored. Returns ``None`` when ``named`` is empty so the
-    compiler keeps its own "input not supplied" errors for nodes that need it.
+    Validates that every universe ticker is present and carries a finite numeric
+    value in each named series; raises ``ValueError`` with series/ticker context
+    otherwise. Extra tickers beyond the universe are ignored. Returns ``None``
+    when ``named`` is empty so the compiler keeps its own "input not supplied"
+    errors for nodes that need it.
     """
     if not named:
         return None
@@ -72,8 +85,17 @@ def align_named(
     for name, by_ticker in named.items():
         missing = [t for t in universe if t not in by_ticker]
         if missing:
-            raise ValueError(
-                f"{label} {name!r} is missing values for universe tickers: {missing}."
-            )
-        out[name] = np.array([float(by_ticker[t]) for t in universe], dtype=float)
+            raise ValueError(f"{label} {name!r} is missing values for universe tickers: {missing}.")
+        values: list[float] = []
+        for ticker in universe:
+            try:
+                value = float(by_ticker[ticker])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"{label} {name!r} value for ticker {ticker!r} must be numeric and finite."
+                ) from exc
+            if not np.isfinite(value):
+                raise ValueError(f"{label} {name!r} value for ticker {ticker!r} must be finite.")
+            values.append(value)
+        out[name] = np.array(values, dtype=float)
     return out
