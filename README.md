@@ -2,6 +2,8 @@
 
 **Describe your portfolio in plain English. Truffle unearths the optimal allocation — and tells you exactly what each constraint costs you.**
 
+Current product requirements and the staged delivery plan live in [PRD.md](PRD.md).
+
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -73,7 +75,7 @@ Truffle is not published to PyPI yet. Install the current development version
 from source:
 
 ```bash
-git clone https://github.com/nithin-arus/Truffle.git
+git clone https://github.com/nithinaru/Truffle.git
 cd Truffle
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"

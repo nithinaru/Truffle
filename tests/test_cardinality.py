@@ -25,6 +25,14 @@ def _spec(constraints) -> PortfolioSpec:
     )
 
 
+def _require_scip() -> str:
+    """Return the MIQP backend or skip when the optional extra is absent."""
+
+    if "SCIP" not in cp.installed_solvers():
+        pytest.skip("SCIP (MIQP backend) not installed; install the 'mip' extra")
+    return cp.SCIP
+
+
 def test_cardinality_forces_mip_problem_class() -> None:
     spec = _spec([Budget(), LongOnly(), Cardinality(max_names=2)])
     assert spec.problem_class == "mip"
@@ -71,7 +79,7 @@ def test_compile_builds_binary_selection_and_links_weights() -> None:
     # Cardinality node in the continuous fix-and-resolve pass.
     assert spec.constraints[-1].id in compiled.constraint_objs
 
-    compiled.problem.solve(solver=cp.SCIP if "SCIP" in cp.installed_solvers() else cp.HIGHS)
+    compiled.problem.solve(solver=_require_scip())
     assert compiled.problem.status == "optimal"
     nonzero = int(np.sum(np.abs(compiled.weights.value) > 1e-4))
     assert nonzero <= 2
@@ -95,8 +103,7 @@ def test_min_position_links_held_weights() -> None:
     # With a 30% floor and max 2 names, the two held names must each be >= 0.30.
     spec = _spec([Budget(), LongOnly(), Cardinality(max_names=2, min_position=0.30)])
     compiled = compile_spec(spec, mu=np.zeros(5), sigma=np.eye(5) * 0.04)
-    solver = cp.SCIP if "SCIP" in cp.installed_solvers() else cp.HIGHS
-    compiled.problem.solve(solver=solver)
+    compiled.problem.solve(solver=_require_scip())
     assert compiled.problem.status == "optimal"
     held = compiled.weights.value[np.abs(compiled.weights.value) > 1e-4]
     assert np.all(held >= 0.30 - 1e-6)
